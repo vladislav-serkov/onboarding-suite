@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "onboarding-suite",
+  "description": "Skills for onboarding Claude Code to Spring Boot fintech projects (Kafka, PostgreSQL, Liquibase, OpenAPI-first)",
+  "owner": {
+    "name": "vserkov",
+    "email": "vladislavserkovv@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "onboarding-suite",
+      "description": "Project-onboarding skill: analyzes a Spring Boot fintech codebase, interviews the user, and generates CLAUDE.md plus project-specific skills",
+      "author": {
+        "name": "vserkov",
+        "email": "vladislavserkovv@gmail.com"
+      },
+      "source": "./plugins/onboarding-suite",
+      "category": "development",
+      "homepage": "https://github.com/vladislav-serkov/onboarding-suite"
+    }
+  ]
+}

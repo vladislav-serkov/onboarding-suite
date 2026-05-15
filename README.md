@@ -2,10 +2,24 @@
 
 Набор скиллов для Claude Code, который превращает любой Spring Boot fintech-проект (BNPL, платежи, банковские микросервисы) в "Claude-ready": генерирует `CLAUDE.md` с правилами и набор проектно-специфичных скиллов под `.claude/skills/`.
 
+## Установка
+
+В Claude Code выполни две команды:
+
+```
+/plugin marketplace add vladislav-serkov/onboarding-suite
+/plugin install onboarding-suite@onboarding-suite
+```
+
+После установки скилл доступен как `/onboarding-suite:project-onboarding` (или просто опиши задачу — Claude подхватит триггеры).
+
+Обновление: `/plugin marketplace update onboarding-suite`.
+Удаление: `/plugin uninstall onboarding-suite@onboarding-suite`.
+
 ## Что внутри
 
 ```
-skills/
+plugins/onboarding-suite/skills/
 └── project-onboarding/                    # мета-скилл — точка входа
     ├── SKILL.md                           # главный prompt, описание триггеров
     ├── phases/                            # инструкции для трёх фаз онбординга

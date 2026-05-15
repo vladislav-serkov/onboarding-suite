@@ -1,0 +1,10 @@
+{
+  "name": "onboarding-suite",
+  "description": "Project-onboarding skill for Spring Boot fintech projects — generates CLAUDE.md and project-specific skills after analyzing the codebase and interviewing the user",
+  "version": "0.1.0",
+  "author": {
+    "name": "vserkov",
+    "email": "vladislavserkovv@gmail.com"
+  },
+  "homepage": "https://github.com/vladislav-serkov/onboarding-suite"
+}
