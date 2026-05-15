@@ -1,0 +1,198 @@
+---
+name: bugfix
+description: Используется когда нужно исправить баг в существующем коде. Триггеры — "фикс бага", "bugfix", "не работает X", "при Y происходит ошибка", "regression", "правка существующей логики". Запускает 5-фазный workflow — локализация → reproduce-тест (RED) → blast radius → fix → regress check. Reproduce-тест воспроизводит баг и становится критерием готовности. Пауза с пользователем только после написания reproduce-теста (нужно подтверждение, что тест действительно показывает баг).
+---
+
+# bugfix
+
+Исправление существующего поведения через reproduce-first TDD.
+
+## Когда использовать
+
+- Существующая функциональность работает не так, как должна.
+- Регрессия после предыдущего изменения.
+- Прод-инцидент с понятным симптомом.
+
+**Не использовать для:**
+- Новой функциональности → workflow `feature`
+- Диагностики проблемы без понятной причины → сначала `investigate`
+
+## Используемые примитивы
+
+Зависит от природы бага. Чаще всего фикс затрагивает:
+- Service-слой — без скилла, прямые правки
+- Migration — `primitives/liquibase-migration` (если нужна правка БД)
+- Tests — `primitives/wiremock-integration-test` (если падает интеграционный)
+
+## Workflow — 5 фаз
+
+### Phase 1 — Локализация
+
+Цель: найти **где именно** живёт затрагиваемая логика.
+
+```bash
+# Поиск по симптому (название endpoint'а, имя класса, текст ошибки)
+grep -r "<ключевая фраза>" --include="*.java" -l
+
+# Если есть stack trace — отправляйся прямо в указанные классы
+# Если есть имя endpoint'а — найди controller и трассируй вглубь до service
+
+# Какие тесты её сейчас покрывают
+grep -r "<имя класса/метода>" --include="*Test.java" -l
+```
+
+Зафиксируй:
+- Где живёт код (файл:строка).
+- Какие тесты его покрывают сейчас.
+- Какие смежные системы зависят от текущего поведения (поиск callers).
+
+Если **не нашёл** код, который нужно править → выйди из bugfix и запусти `workflow/investigate` для диагностики.
+
+### Phase 2 — Reproduce тест (RED) ⏸ ПАУЗА
+
+Напиши **failing-тест**, который воспроизводит баг.
+
+Тип теста зависит от природы бага:
+- Бизнес-логика → unit-тест на service
+- HTTP контракт → controller-test (`@WebMvcTest`)
+- Полная цепочка → acceptance-тест с Testcontainers
+
+```java
+@Test
+void createRefund_whenSameIdempotencyKeyUsedTwice_shouldReturnSameRefundId() {
+    // BUG: текущее поведение создаёт два refund'а вместо одного
+    // EXPECTED: повтор возвращает идентичный response
+
+    UUID paymentId = createPayment();
+    String idempotencyKey = "test-key-" + UUID.randomUUID();
+
+    RefundResponse first = refundService.createRefund(paymentId, 1000L, idempotencyKey);
+    RefundResponse second = refundService.createRefund(paymentId, 1000L, idempotencyKey);
+
+    assertThat(first.refundId()).isEqualTo(second.refundId());
+
+    // Проверка что в БД действительно один refund
+    long count = refundRepository.countByPaymentId(paymentId);
+    assertThat(count).isEqualTo(1L);
+}
+```
+
+Запусти тест — должен **fail с понятной ошибкой**, демонстрирующей баг.
+
+**ПАУЗА:** Покажи пользователю:
+- Reproduce-тест.
+- Output его выполнения (где именно падает, с каким сообщением).
+- Спроси: "Этот тест действительно показывает твой баг? Если да — иду фиксить."
+
+Если пользователь говорит "это другой баг" — скорректируй тест и повтори ПАУЗУ.
+
+### Phase 3 — Blast radius анализ
+
+Прежде чем менять код, найди что ещё может сломаться.
+
+**Сигналы для blast radius:**
+
+1. **Кто вызывает изменяемый метод?**
+   ```bash
+   grep -r "<methodName>" --include="*.java" -l
+   ```
+
+2. **Кто слушает изменяемое Kafka-событие?**
+   - Поиск `@KafkaListener` по тому же топику в других сервисах (если monorepo).
+
+3. **Какие SQL-запросы зависят от изменяемой схемы?**
+   - Если меняешь поле — поиск `SELECT.*<field>` и `INSERT.*<field>`.
+
+4. **Меняется ли публичный HTTP контракт?**
+   - Если правка касается DTO в OpenAPI спеке — это breaking change для клиентов.
+
+Зафиксируй blast radius:
+
+```
+Blast radius:
+  - 3 caller'а RefundService.createRefund:
+    * RefundController (без изменений в поведении)
+    * AdminController.forceRefund (нужно проверить)
+    * RefundRetryJob (scheduled, нужно проверить логику ретраев)
+  - Outbox event RefundCreated публикуется — слушает RBO consumer (НЕ ломаем)
+  - SQL схема не меняется
+  - HTTP контракт — добавляется идемпотентный замыкатель, не breaking
+```
+
+Если blast radius содержит breaking changes — **подними в чате до Phase 4** (это исключение из правила "одна пауза"):
+- "Фикс затронет публичный API. Точно идём дальше?"
+
+### Phase 4 — Fix (минимальный)
+
+Реализуй **минимальное** изменение, которое делает reproduce-тест зелёным.
+
+**НЕ делай рефактор соседнего кода в том же фиксе.** Один баг = одно изменение. Если по ходу видно что рядом плохо — сделай заметку, но фикси отдельным коммитом / задачей.
+
+После реализации:
+```bash
+./mvnw -pl <module> test -Dtest=<ReproduceTest>
+```
+
+Reproduce-тест → GREEN.
+
+### Phase 5 — Точечный регресс (по blast radius)
+
+Полный test suite **здесь не запускаем** — это работа `workflow/create-mr` перед MR. Дублировать прогон бессмысленно (минуты CI впустую) и опасно (рискуем не дочитать симптом).
+
+Здесь прогоняем только то, что реально могло пострадать:
+
+1. **Reproduce-тест + соседи в том же классе:**
+   ```bash
+   ./mvnw -pl <module> test -Dtest=<ReproduceTestClass>
+   ```
+
+2. **Caller'ы из Phase 3 (blast radius):**
+   ```bash
+   ./mvnw test -Dtest=AdminControllerTest,RefundRetryJobTest
+   ```
+
+3. **Тесты модуля, в котором правил код** (быстрее чем весь project):
+   ```bash
+   ./mvnw -pl <module> test
+   ```
+
+Всё GREEN → Phase 6. Что-то сломалось — у бага был "valid use case", который ты затронул фиксом, возвращайся в Phase 4 с уточнением.
+
+**Полный регресс (`{{ commands.test }}`) откладывается до `workflow/create-mr` Phase X.** Это единая точка истины для "готово к merge".
+
+### Phase 6 — Hand-off
+
+```
+✅ Bugfix готов.
+
+Bug: При повторном POST с тем же Idempotency-Key создавался второй refund.
+Fix: Добавлена проверка существующей записи по idempotency_key до создания нового refund.
+
+Reproduce-тест: src/test/.../RefundServiceTest.java:createRefund_whenSameIdempotencyKeyUsedTwice_shouldReturnSameRefundId
+
+Что изменено:
+  M src/main/java/.../service/RefundService.java (10 строк)
+  M src/main/java/.../service/IdempotencyService.java (3 строки)
+  A src/test/java/.../service/RefundServiceTest.java (новый тест)
+
+Точечный регресс: модуль <module> + caller'ы из blast radius — GREEN.
+Полный регресс по проекту НЕ запускался — это сделает create-mr.
+
+Что дальше:
+  → workflow/create-mr для создания MR (там полный test suite + diff review).
+```
+
+## Жёсткие правила
+
+1. **Reproduce-тест пишется ПЕРВЫМ.** Без него ты не знаешь, что фиксил.
+2. **Reproduce-тест должен fail демонстрируя баг.** Если "тест проходит" — ты не воспроизвёл баг, вернись в Phase 1.
+3. **Минимальный fix.** Один баг = одно изменение. Соседние улучшения — отдельной задачей.
+4. **Регресс обязателен.** Сломал смежное — твоя ответственность.
+5. **Не правь reproduce-тест, чтобы он позеленел без фикса.** Это подмена цели.
+
+## Подводные камни
+
+- **Heisenbug.** Если тест падает не всегда — это race condition или зависимость от внешнего состояния. Не трогай таймауты, разбирайся в причине.
+- **"Баг" может быть фичей.** Если поведение задокументировано в спеке/тестах как намеренное — обсуди с пользователем что чинить: поведение или спеку.
+- **Регрессия после фикса.** Если ваш фикс ломает другой тест — этот тест может **тоже** быть багом, который никто не замечал. Не молча правь — обсуди.
+- **Не забудь про logs.** Если баг был тяжело локализуем из-за плохих логов — добавь structured log в фикс. Это инвестиция в будущее.

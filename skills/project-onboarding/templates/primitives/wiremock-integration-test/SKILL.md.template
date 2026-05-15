@@ -1,0 +1,260 @@
+---
+name: wiremock-integration-test
+description: Используется для написания интеграционного теста взаимодействия с внешним HTTP сервисом через WireMock. Триггеры — "интеграционный тест", "WireMock", "замокай внешний сервис", "test external API", "integration test". Создаёт тестовый класс с правильной WireMock setup — точная версия совпадающая с server, динамический порт, resetAll в @BeforeEach (не @BeforeAll), AssertJ + Hamcrest без ambiguous overloads, scenario stubs для последовательных вызовов, fixed delay для timeout-тестов, verify с exact count.
+---
+
+# wiremock-integration-test
+
+Интеграционный тест с замоканным внешним сервисом.
+
+## Жёсткое правило
+Версия WireMock **client** должна совпадать с **server**. Mismatch → молчаливые 404 на стабах. У нас обе `{{ libs.wiremock }}`.
+
+## Workflow
+
+### Шаг 1 — Зависимости
+
+В pom.xml тестируемого модуля:
+
+```xml
+<dependency>
+    <groupId>org.wiremock</groupId>
+    <artifactId>wiremock-standalone</artifactId>
+    <version>{{ libs.wiremock }}</version>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.wiremock.integrations</groupId>
+    <artifactId>wiremock-spring-boot</artifactId>
+    <version>3.5.4</version>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>io.rest-assured</groupId>
+    <artifactId>rest-assured</artifactId>
+    <version>{{ libs.rest_assured }}</version>
+    <scope>test</scope>
+</dependency>
+```
+
+Если `libs.wiremock` пустой в твоём проекте — это значит WireMock не установлен. Возвращайся в discovery либо предлагай альтернативу (MockWebServer, MockRestServiceServer).
+
+### Шаг 2 — Тестовый application.yaml
+
+`src/test/resources/application-test.yaml`:
+
+```yaml
+app:
+  payment-provider:
+    base-url: http://localhost:${wiremock.server.port}
+    connect-timeout-ms: 1000
+    read-timeout-ms: 5000
+```
+
+`${wiremock.server.port}` — динамическая подстановка порта. Хардкодить нельзя, иначе тесты падают на CI с port collision.
+
+### Шаг 3 — Тестовый класс
+
+```java
+package {{ conventions.package_root }}.integration;
+
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.WireMock;
+import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.wiremock.AutoConfigureWireMock;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
+
+import java.time.Duration;
+import java.util.UUID;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@SpringBootTest
+@ActiveProfiles("test")
+@AutoConfigureWireMock(port = 0)  // 0 = случайный свободный порт
+class PaymentProviderClientIntegrationTest {
+
+    @Autowired
+    private PaymentProviderClient client;
+
+    @Autowired
+    private WireMockServer wireMockServer;
+
+    @BeforeEach
+    void resetMocks() {
+        // ВАЖНО: @BeforeEach, не @BeforeAll — иначе stub'ы переживают между тестами
+        wireMockServer.resetAll();
+    }
+
+    @Test
+    void chargePayment_serverReturns200_returnsSuccessResponse() {
+        // given
+        UUID paymentId = UUID.randomUUID();
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/charge"))
+            .withHeader("Content-Type", containing("application/json"))
+            .withRequestBody(matchingJsonPath("$.paymentId", equalTo(paymentId.toString())))
+            .willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "application/json")
+                .withBody("""
+                    {
+                        "transactionId": "tx-123",
+                        "status": "APPROVED"
+                    }
+                    """)));
+
+        // when
+        PaymentResponse response = client.charge(paymentId, 1000L);
+
+        // then
+        assertThat(response.transactionId()).isEqualTo("tx-123");
+        assertThat(response.status()).isEqualTo("APPROVED");
+
+        // verify exact call count
+        wireMockServer.verify(1, postRequestedFor(urlPathEqualTo("/v1/charge")));
+    }
+
+    @Test
+    void chargePayment_serverReturns500_throwsPaymentProviderException() {
+        // given
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/charge"))
+            .willReturn(aResponse().withStatus(500).withBody("Internal Server Error")));
+
+        // when / then
+        assertThatThrownBy(() -> client.charge(UUID.randomUUID(), 1000L))
+            .isInstanceOf(PaymentProviderException.class)
+            .hasMessageContaining("500");
+    }
+
+    @Test
+    void chargePayment_serverDelayedBeyondTimeout_throwsTimeoutException() {
+        // given — задержка превышает read-timeout (5000ms из application-test.yaml)
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/charge"))
+            .willReturn(aResponse()
+                .withFixedDelay(7000)
+                .withStatus(200)));
+
+        // when / then
+        assertThatThrownBy(() -> client.charge(UUID.randomUUID(), 1000L))
+            .isInstanceOf(PaymentProviderException.class)
+            .hasMessageContainingAny("timeout", "timed out");
+    }
+
+    @Test
+    void chargePayment_firstCallFails_secondSucceeds_retryWorks() {
+        // given — scenario для последовательных вызовов
+        String scenario = "PaymentRetry";
+
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/charge"))
+            .inScenario(scenario)
+            .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+            .willReturn(aResponse().withStatus(503))
+            .willSetStateTo("AfterFirstAttempt"));
+
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/charge"))
+            .inScenario(scenario)
+            .whenScenarioStateIs("AfterFirstAttempt")
+            .willReturn(aResponse()
+                .withStatus(200)
+                .withBody("""
+                    {"transactionId":"tx-retry","status":"APPROVED"}
+                    """)));
+
+        // when
+        PaymentResponse response = client.chargeWithRetry(UUID.randomUUID(), 1000L);
+
+        // then
+        assertThat(response.transactionId()).isEqualTo("tx-retry");
+        wireMockServer.verify(2, postRequestedFor(urlPathEqualTo("/v1/charge")));
+    }
+}
+```
+
+### Шаг 4 — REST Assured тест endpoint'а с WireMock в зависимости
+
+```java
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+@AutoConfigureWireMock(port = 0)
+class RefundEndpointIntegrationTest {
+
+    @LocalServerPort
+    private int appPort;
+
+    @Autowired
+    private WireMockServer wireMockServer;
+
+    @BeforeEach
+    void setUp() {
+        RestAssured.port = appPort;
+        wireMockServer.resetAll();
+    }
+
+    @Test
+    void postRefund_paymentProviderApproves_returns200() {
+        // given — мокаем внешний платёжный провайдер
+        wireMockServer.stubFor(post(urlPathEqualTo("/v1/refund"))
+            .willReturn(okJson("""
+                {"refundTransactionId":"rt-123","status":"APPROVED"}
+                """)));
+
+        // when / then
+        given()
+            .header("Idempotency-Key", UUID.randomUUID().toString())
+            .contentType(ContentType.JSON)
+            .body("""
+                {"paymentId":"%s","amount":1000}
+                """.formatted(UUID.randomUUID()))
+        .when()
+            .post("/api/v1/refunds")
+        .then()
+            .statusCode(200)
+            .body("status", equalTo("PENDING"));
+
+        wireMockServer.verify(postRequestedFor(urlPathEqualTo("/v1/refund")));
+    }
+}
+```
+
+## AssertJ vs Hamcrest
+
+REST Assured использует Hamcrest matcher'ы (`equalTo`, `containsString`). Spring Test тоже Hamcrest. AssertJ — отдельная история.
+
+Чтобы избежать ambiguous overloads:
+
+```java
+// Hamcrest для REST Assured внутри .body(...)
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.containsString;
+
+// AssertJ для всего остального — импортируй через assertThat
+import static org.assertj.core.api.Assertions.assertThat;
+```
+
+**Не** делать `import static org.hamcrest.MatcherAssert.assertThat` в одном файле с AssertJ — компилятор начинает путаться.
+
+## Что **не** делать
+
+- ❌ `@BeforeAll` для `wireMockServer.resetAll()` — между тестами останется state.
+- ❌ Хардкод порта (`http://localhost:8089`) — port collision на CI.
+- ❌ `urlEqualTo` вместо `urlPathEqualTo` для путей с query params — слишком строгий matcher, будет ловить только если query совпадает.
+- ❌ Игнорировать `verify` — без него тест зелёный даже если код вообще не вызвал WireMock.
+- ❌ `Thread.sleep(1000)` для ожидания async вызовов — используй Awaitility.
+
+## Подводные камни
+
+- **Stub registration timing.** При `@SpringBootTest` стабы регистрируй в `@BeforeEach`, не `@BeforeAll` — wireMockServer переинициализируется между тестами.
+- **HTTPS сервисы.** Для HTTPS нужен `@AutoConfigureWireMock(httpsPort = ...)` плюс настройки SSL trust store в клиенте.
+- **Версия client vs server.** Если в `mvn dependency:tree` видишь две разные версии `wiremock-jetty12` или `wiremock-standalone` — будет молчаливые 404. Исключай транзитивные зависимости.
+- **JSON path matching.** `matchingJsonPath("$.field", equalTo("value"))` — двухаргументная форма точная, однопараметрная `matchingJsonPath("$.field")` только проверяет существование.
+- **Spring Boot 3 vs 2.** Аннотация `@AutoConfigureWireMock` в SB3 идёт из `wiremock-spring-boot` (новый), в SB2 — из `spring-cloud-contract-wiremock` (старый).
+
+## Связанные скиллы
+
+- Endpoint который тестируется → `openapi-first-endpoint`
+- Если нужен Kafka в том же тесте → `kafka-producer-consumer`

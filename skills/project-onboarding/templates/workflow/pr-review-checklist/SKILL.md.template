@@ -1,0 +1,225 @@
+---
+name: pr-review-checklist
+description: Используется для проверки готового diff против правил CLAUDE.md проекта. Триггеры — "проверь мой diff", "review мой код", "self-review", "что не так с моими изменениями", "PR review". Также вызывается автоматически из workflow create-mr Phase 2. Прогоняет diff через серию проверок и возвращает список нарушений с severity (HIGH/MEDIUM/LOW) и предложениями фикса. Не правит код сам — только репортит.
+---
+
+# pr-review-checklist
+
+Diff против правил CLAUDE.md.
+
+## Когда использовать
+
+- Перед созданием MR — самопроверка.
+- Внутри `workflow/create-mr` Phase 2.
+- По прямому запросу: "проверь мой diff".
+
+## Output формат
+
+```
+# PR Review
+
+Diff: 12 файлов, +287 / -34
+
+## Нарушения
+
+### HIGH (блокеры)
+- **§3.2 Outbox bypass** — RefundService.java:78
+  Прямой `kafkaTemplate.send()` в @Transactional методе.
+  → Используй OutboxService.publish().
+
+### MEDIUM
+- **§5 SQL без префикса** — RefundRepository.java:45
+  Native query: `SELECT * FROM refund WHERE ...`
+  → Должно быть `SELECT * FROM {{ conventions.sql_schema }}.refund WHERE ...`
+
+### LOW
+- **§3.4 Транзакция в controller** — RefundController.java:32
+  @Transactional в controller-методе.
+  → Перенеси в RefundService.
+
+- **§7 Тестовое покрытие** — нет unit-теста для RefundValidator
+  → Добавь хотя бы 2 happy path + 1 edge case теста.
+
+## Чисто
+- ✓ OpenAPI spec соответствует controller
+- ✓ Liquibase changesets имеют rollback
+- ✓ Идемпотентность реализована
+- ✓ Логи без PII (cards, fio, phone не встречаются)
+- ✓ Не редактируются generated DTO
+
+## Резюме
+2 HIGH/MEDIUM требуют внимания, 2 LOW для следующей итерации.
+```
+
+## Workflow
+
+### Phase 1 — Получение diff
+
+Если вызвано из `create-mr`:
+```bash
+git diff origin/{{ git.default_branch }}...HEAD
+```
+
+Если вызвано напрямую пользователем — спроси что проверять:
+- Текущие uncommitted изменения: `git diff` + `git diff --staged`
+- Последний коммит: `git diff HEAD~1`
+- Сравнение с веткой: `git diff origin/develop...HEAD`
+
+### Phase 2 — Прогон проверок
+
+Применяй чек-листы по категориям. Каждое нарушение — запись с **§ ссылкой на CLAUDE.md** (так пользователю проще понять контекст).
+
+#### §3.1 OpenAPI-first
+
+```bash
+# Изменения в generated-sources (запрещено)
+git diff --name-only | grep "generated-sources" && \
+  echo "HIGH: редактируются generated DTO"
+
+# Новые @PostMapping/@GetMapping без OpenAPI спеки
+NEW_MAPPINGS=$(git diff -U0 | grep -E "^\+.*@(Get|Post|Put|Delete|Patch)Mapping")
+for mapping in <each>; do
+  # Проверь что соответствующий endpoint есть в openapi/*.yaml
+  ...
+done
+```
+
+#### §3.2 Outbox
+
+```bash
+# Прямой kafkaTemplate.send() в @Transactional
+# Эвристика: ищем @Transactional + KafkaTemplate в одном файле, проверяем близость
+git diff -U10 | grep -B 10 "kafkaTemplate.send\|kafkaTemplate\.send" | grep "@Transactional"
+```
+
+Если нашёл — HIGH.
+
+#### §3.3 Идемпотентность
+
+```bash
+# Новые POST endpoint'ы без Idempotency-Key
+git diff -U10 | grep -E "@PostMapping" -A 20 | grep -L "Idempotency-Key\|idempotencyKey"
+```
+
+Зависит от `team_decisions.idempotency_required` — если "обязательна для всех POST" — HIGH, иначе MEDIUM.
+
+#### §3.4 Транзакционность
+
+```bash
+# @Transactional в controller
+git diff -U5 | grep -B 5 "@RestController\|extends.*Controller" | grep "@Transactional"
+```
+
+LOW (не блокер, но плохая практика).
+
+#### §4 SQL без префикса схемы
+
+```bash
+# Native queries без {{ conventions.sql_schema }}
+git diff -U0 | grep -E "^\+.*@Query.*nativeQuery\s*=\s*true" -A 5 | \
+  grep -E "FROM\s+[a-z_]+(?<!{{ conventions.sql_schema }})\." 
+```
+
+MEDIUM.
+
+#### §5 Lombok анти-паттерны
+
+```bash
+# @Data на @Entity (запрещено)
+git diff | grep -B 3 "@Entity" | grep "@Data"
+```
+
+HIGH.
+
+```bash
+# Lombok policy compliance
+# Если policy = "DTOs only" — не должно быть @Data в src/main/java/.../service/, /entity/, /domain/
+```
+
+#### §5 Запреты
+
+```bash
+# Хардкод секретов (heuristic)
+git diff -U0 | grep -E "^\+.*(password\s*=|secret\s*=|token\s*=)\s*\"[^\"$]" | \
+  grep -v "Test\|test\|application-test"
+```
+
+HIGH (но false positives возможны — упомяни что нужна ручная проверка).
+
+#### §7 Тесты
+
+```bash
+# Новые public methods в service без тестов
+NEW_SERVICE_METHODS=$(git diff -U0 | grep -E "^\+.*public.*(?<!Test)\.java" | grep "src/main/java")
+
+for method in $NEW_SERVICE_METHODS; do
+  # Поиск соответствующего теста
+  ...
+done
+```
+
+MEDIUM.
+
+```bash
+# Тесты с Thread.sleep
+git diff | grep -E "Thread\.sleep" | grep -v "//\|@Disabled"
+```
+
+MEDIUM (тесты должны использовать Awaitility).
+
+#### §8 PII в логах
+
+```bash
+# Подозрительные log statements с потенциальным PII
+git diff -U0 | grep -E "^\+.*log\.(info|debug|warn|error)" | \
+  grep -E "(card|cvv|password|token|ssn|passport|phone|email)" | \
+  grep -v "mask\|hash\|\\.\\.\\.\|hidden"
+```
+
+HIGH (для fintech).
+
+#### §9 Validation
+
+```bash
+# Новые request DTO без валидации
+git diff -U10 | grep -B 5 "class.*Request" | grep -L "@Valid\|@NotNull\|@NotBlank\|@Pattern"
+```
+
+MEDIUM.
+
+### Phase 3 — Сборка отчёта
+
+Группируй по severity, для каждого нарушения:
+- **§ ссылка на CLAUDE.md** (где правило)
+- **Файл:строка**
+- **Что нашли**
+- **Как фиксить**
+
+Также упомяни что **прошло чисто** — это не пустая похвала, это сигнал что чек-лист отработал и эти категории проверены.
+
+### Phase 4 — Итог
+
+```
+## Резюме
+N HIGH блокеров, M MEDIUM проблем, K LOW замечаний.
+
+Рекомендация:
+  - HIGH > 0: не отправляй MR пока не пофиксишь
+  - HIGH = 0, MEDIUM > 0: можно отправлять, но обсуди в MR description
+  - Только LOW: чисто, можно мержить
+```
+
+## Жёсткие правила
+
+1. **Не правлю код сам.** Только репорт.
+2. **Привязывай к §.** Каждое нарушение → ссылка на CLAUDE.md секцию. Без неё пользователю непонятно "почему так".
+3. **Severity честно.** Не делай всё HIGH — это размывает сигнал. HIGH только для реальных блокеров.
+4. **False positives возможны.** В сомнительных случаях помечай как "требует ручной проверки", не как "найдена проблема".
+5. **Файл:строка обязательно.** Без этого пользователь не найдёт где смотреть.
+
+## Подводные камни
+
+- **Diff context.** Часть нарушений видна только при -U10 контексте (например, Lombok @Data на классе с @Entity — нужен контекст вокруг). Используй `git diff -U10` для проверок требующих контекста, `-U0` где достаточно одной строки.
+- **Generated code.** Игнорируй `target/generated-sources/`, `build/generated/` — там Lombok delombok, OpenAPI generator output, и т.п.
+- **Подозрение != нарушение.** "Хардкод секрета" может оказаться тестовым stub'ом. Помечай как "проверь вручную" вместо HIGH.
+- **CLAUDE.md может расходиться с реальностью.** Если правило в CLAUDE.md, но в проекте 50 случаев его нарушения — обсуди с пользователем что обновлять (правило или код).

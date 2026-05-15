@@ -1,0 +1,173 @@
+---
+name: openapi-first-endpoint
+description: Используется для добавления нового HTTP endpoint в проект с OpenAPI-first workflow. Триггеры — "добавь endpoint", "новый эндпоинт", "add endpoint", "expose new API". Обновляет OpenAPI спеку, регенерирует DTO через Maven plugin, создаёт controller skeleton реализующий generated interface. Поддерживает два режима — skeleton (для TDD Phase 4 в feature workflow) и implement (полная реализация). Никогда не редактирует generated DTO.
+---
+
+# openapi-first-endpoint
+
+Добавление нового HTTP endpoint.
+
+## Жёсткое правило
+Сгенерированные DTO **никогда не редактируются руками**. Источник правды — `openapi/*.yaml`.
+
+## Режимы работы
+
+- **`skeleton`** — добавить endpoint в спеку, регенерить DTO, создать controller возвращающий 501. Используется в `workflow/feature` Phase 4.
+- **`implement`** — добавить spec + регенерация + controller с делегацией в service + service-layer logic. Используется при прямом вызове или в Phase 5 `feature`.
+
+## Workflow
+
+### Шаг 1 — Найди спеку
+
+```bash
+find . -path "*/openapi/*" \( -name "*.yaml" -o -name "*.yml" \)
+```
+
+Если спек несколько — выбери по доменной принадлежности endpoint'а.
+
+### Шаг 2 — Добавь endpoint в спеку
+
+```yaml
+paths:
+  {{ conventions.http_path_template }}/refund:
+    post:
+      tags: [Payments]
+      operationId: createRefund
+      summary: Создать возврат по платежу
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefundRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefundResponse' }
+        '409':
+          description: Конфликт идемпотентности
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422':
+          description: Бизнес-ошибка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+components:
+  schemas:
+    RefundRequest:
+      type: object
+      required: [paymentId, amount]
+      properties:
+        paymentId: { type: string, format: uuid }
+        amount: { type: integer, format: int64, description: "копейки" }
+        reason: { type: string }
+    RefundResponse:
+      type: object
+      required: [refundId, status]
+      properties:
+        refundId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [PENDING, COMPLETED, FAILED]
+```
+
+**Правила схем:**
+- Денежные суммы — `integer` в минорных единицах (никогда `number`/`double`).
+- ID — `format: uuid`.
+- `required` явно для всех обязательных полей.
+- Enum — UPPER_SNAKE_CASE.
+
+### Шаг 3 — Регенерация DTO
+
+```bash
+./mvnw clean compile -pl <module-with-spec>
+```
+
+Если падает: невалидный YAML / дубликат operationId / конфликт схем.
+
+### Шаг 4 — Найди generated API interface
+
+```bash
+find . -path "*/generated-sources/*" -name "*Api.java" | grep -i <domain>
+```
+
+### Шаг 5 — Controller
+
+#### Режим `skeleton`
+
+```java
+@RestController
+public class PaymentsController implements PaymentsApi {
+    @Override
+    public ResponseEntity<RefundResponse> createRefund(String idempotencyKey, RefundRequest request) {
+        // TODO: Phase 5 (feature workflow)
+        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
+    }
+}
+```
+
+#### Режим `implement`
+
+```java
+package {{ conventions.package_root }}.controller;
+
+import {{ conventions.package_root }}.api.PaymentsApi;
+import {{ conventions.package_root }}.api.dto.RefundRequest;
+import {{ conventions.package_root }}.api.dto.RefundResponse;
+import {{ conventions.package_root }}.service.RefundService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class PaymentsController implements PaymentsApi {
+
+    private final RefundService refundService;
+
+    public PaymentsController(RefundService refundService) {
+        this.refundService = refundService;
+    }
+
+    @Override
+    public ResponseEntity<RefundResponse> createRefund(String idempotencyKey, RefundRequest request) {
+        return ResponseEntity.ok(refundService.createRefund(idempotencyKey, request));
+    }
+}
+```
+
+**Важно:**
+- Controller `implements <Generated>Api` — никогда не пиши `@PostMapping` руками.
+- Бизнес-логика в service — controller только делегирует.
+- `@Transactional` на service, не на controller (CLAUDE.md §3.4).
+
+### Шаг 6 — Проверка
+
+```bash
+./mvnw -pl <module> test
+./mvnw -pl <module> spring-boot:run
+
+curl -X POST http://localhost:8080{{ conventions.http_path_template }}/refund \
+  -H 'Idempotency-Key: 123e4567-e89b-12d3-a456-426614174000' \
+  -H 'Content-Type: application/json' \
+  -d '{"paymentId":"...","amount":1000}'
+```
+
+## Что **не** делать
+
+- ❌ `@PostMapping("/refund")` в controller минуя спеку.
+- ❌ Редактировать `target/generated-sources/...`.
+- ❌ Копировать DTO в свой пакет, чтобы добавить поле.
+- ❌ `Map<String, Object>` как request/response body.
+
+## Связанные скиллы
+
+- Идемпотентность → `idempotency-handler`
+- Если триггерит Kafka event → `outbox-event`
+- Интеграционный тест → `wiremock-integration-test`

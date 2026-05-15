@@ -1,0 +1,184 @@
+---
+name: liquibase-migration
+description: Используется для создания миграции БД через Liquibase. Триггеры — "новая миграция", "добавь таблицу", "create migration", "liquibase changeset", "schema change". Генерирует changeset с SQL-схемой проекта, naming convention и обязательной rollback секцией. Поддерживает паттерны — таблицы, колонки, индексы (включая партиальные с CONCURRENTLY), backfill данных, FK с NOT VALID для больших таблиц.
+---
+
+# liquibase-migration
+
+Создание миграции БД с конвенциями проекта.
+
+## Жёсткие правила
+- SQL схема **всегда** с префиксом `{{ conventions.sql_schema }}`.
+- Каждый changeset обязан иметь `<rollback>` секцию (или явный комментарий с причиной).
+- Naming changeset id: `{{ conventions.changeset_naming }}`.
+
+## Workflow
+
+### Шаг 1 — Найди changelog
+
+```bash
+find . -path "*/db/changelog/*" \( -name "db.changelog-master*" -o -name "changelog.xml" \)
+```
+
+Структура обычно:
+```
+src/main/resources/db/changelog/
+├── db.changelog-master.yaml
+├── 2026/05/
+│   ├── 20260508-01-add-refund-table.yaml
+│   └── 20260508-02-add-refund-indexes.yaml
+```
+
+### Шаг 2 — Создай changeset
+
+Файл: `db/changelog/{{ today_yyyy }}/{{ today_mm }}/{{ today_yyyymmdd }}-NN-<description>.yaml`
+
+```yaml
+databaseChangeLog:
+  - changeSet:
+      id: {{ today_yyyymmdd }}-01-add-refund-table
+      author: <твой логин>
+      comment: Таблица возвратов для BNPL gateway
+      changes:
+        - createTable:
+            schemaName: {{ conventions.sql_schema }}
+            tableName: refund
+            columns:
+              - column: { name: id, type: uuid, constraints: { primaryKey: true, nullable: false } }
+              - column:
+                  name: payment_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+                    foreignKeyName: fk_refund_payment
+                    references: {{ conventions.sql_schema }}.payment(id)
+              - column: { name: amount, type: bigint, constraints: { nullable: false } }
+              - column: { name: status, type: varchar(32), constraints: { nullable: false } }
+              - column:
+                  name: created_at
+                  type: timestamp with time zone
+                  defaultValueComputed: NOW()
+                  constraints: { nullable: false }
+              - column:
+                  name: updated_at
+                  type: timestamp with time zone
+                  defaultValueComputed: NOW()
+                  constraints: { nullable: false }
+      rollback:
+        - dropTable:
+            schemaName: {{ conventions.sql_schema }}
+            tableName: refund
+```
+
+### Шаг 3 — Зарегистрируй в master
+
+```yaml
+databaseChangeLog:
+  - includeAll:
+      path: classpath:db/changelog/{{ today_yyyy }}/{{ today_mm }}/
+      relativeToChangelogFile: false
+```
+
+### Шаг 4 — Тестовый прогон
+
+```bash
+./mvnw -pl <module> liquibase:update
+psql -h localhost -U postgres -d <db> -c "\dt {{ conventions.sql_schema }}.*"
+./mvnw -pl <module> liquibase:rollback -Dliquibase.rollbackCount=1
+```
+
+## Типичные паттерны
+
+### Добавление колонки
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-add-refund-reason
+    author: <логин>
+    changes:
+      - addColumn:
+          schemaName: {{ conventions.sql_schema }}
+          tableName: refund
+          columns:
+            - column: { name: reason, type: varchar(500) }
+    rollback:
+      - dropColumn:
+          schemaName: {{ conventions.sql_schema }}
+          tableName: refund
+          columnName: reason
+```
+
+### Партиальный индекс (для Outbox)
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-outbox-pending-index
+    author: <логин>
+    changes:
+      - sql:
+          dbms: postgresql
+          sql: |
+            CREATE INDEX CONCURRENTLY idx_outbox_pending
+            ON {{ conventions.sql_schema }}.outbox (created_at)
+            WHERE sent_at IS NULL;
+    rollback:
+      - sql:
+          sql: DROP INDEX IF EXISTS {{ conventions.sql_schema }}.idx_outbox_pending;
+    runInTransaction: false
+```
+
+### Backfill данных
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-backfill-refund-status
+    author: <логин>
+    changes:
+      - sql:
+          sql: |
+            UPDATE {{ conventions.sql_schema }}.refund
+            SET status = 'PENDING'
+            WHERE status IS NULL;
+    rollback:
+      - sql:
+          sql: SELECT 1; -- irreversible: backfill не откатывается
+```
+
+### FK на большую таблицу (NOT VALID + VALIDATE отдельно)
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-add-fk-not-valid
+    changes:
+      - sql:
+          sql: |
+            ALTER TABLE {{ conventions.sql_schema }}.refund
+            ADD CONSTRAINT fk_refund_payment_new
+            FOREIGN KEY (payment_id) REFERENCES {{ conventions.sql_schema }}.payment(id)
+            NOT VALID;
+    rollback:
+      - sql:
+          sql: ALTER TABLE {{ conventions.sql_schema }}.refund DROP CONSTRAINT fk_refund_payment_new;
+
+- changeSet:
+    id: {{ today_yyyymmdd }}-02-validate-fk
+    changes:
+      - sql:
+          sql: ALTER TABLE {{ conventions.sql_schema }}.refund VALIDATE CONSTRAINT fk_refund_payment_new;
+    rollback:
+      - sql:
+          sql: SELECT 1; -- VALIDATE необратима
+```
+
+## Что **не** делать
+
+- ❌ `tableName: refund` без `schemaName` — пойдёт в `public`.
+- ❌ Менять existing changeset (Liquibase падает по checksum). Нужно поправить — создай новый changeset.
+- ❌ `runOnChange: true` без острой необходимости.
+- ❌ Длинные `UPDATE`/`ALTER` на больших таблицах без `CONCURRENTLY` или batch'инга.
+
+## Подводные камни
+
+- **Lock на старте:** при падении приложения во время миграции `databasechangeloglock.LOCKED=true`. Очисти руками: `UPDATE {{ conventions.sql_schema }}.databasechangeloglock SET LOCKED=false`.
+- **CONCURRENTLY в Postgres:** требует `runInTransaction: false`.
+- **Большие FK:** добавляй `NOT VALID` сначала, потом `VALIDATE CONSTRAINT` отдельным changeset'ом.

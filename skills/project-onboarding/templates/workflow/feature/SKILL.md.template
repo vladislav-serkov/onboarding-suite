@@ -1,0 +1,426 @@
+---
+name: feature
+description: Используется когда пользователь хочет реализовать новую фичу или получить план по ТЗ. Триггеры — "сделай фичу", "implement feature", "реализуй ТЗ", "новая фича", "разбери ТЗ", "сделай план", "проанализируй спеку", "/feature", или передача ТЗ-файла. Поддерживает два режима — полный (план + реализация через TDD) и `--plan-only` (только Phase 1-2, останавливается после подтверждения плана и отдаёт JSON). Полный режим запускает 8-фазный TDD workflow — парсинг ТЗ → план → acceptance-тест (RED) → skeleton → unit-TDD цикл per компонент → acceptance check (GREEN) → регресс → handoff. Пауза только на этапе подтверждения плана; дальше работает автономно. Всегда следует строгому TDD — acceptance-тест пишется первым и остаётся RED до Phase 6.
+---
+
+# feature
+
+Реализация новой фичи через строгий TDD-цикл.
+
+## Когда использовать
+
+- Реализация новой функциональности (endpoint, consumer, scheduled, combo).
+- Есть ТЗ (markdown) или внятный промпт.
+- Готовность к TDD: проект имеет Testcontainers и тестовые конфиги (или принимаем что добавим в Phase 4).
+- Нужен **только план** по ТЗ без реализации — используй `--plan-only`.
+
+**Не использовать для:**
+- Багфикса существующего поведения → workflow `bugfix`
+- Диагностики → workflow `investigate`
+- Финализации готового кода → workflow `create-mr`
+
+## Режимы
+
+| Режим | Как вызвать | Что делает |
+|---|---|---|
+| **Полный** (default) | `/feature <ТЗ>` или "сделай фичу из docs/refund.md" | Phase 1 → 8: план + acceptance-тест + skeleton + TDD + регресс + hand-off |
+| **Plan-only** | `/feature --plan-only <ТЗ>`, "разбери ТЗ", "сделай только план" | Phase 1 → 2: парсит ТЗ, показывает JSON-план + gaps + blast radius и **останавливается**. Не пишет код. |
+
+Plan-only полезен когда:
+- ТЗ сырое и нужен gaps-анализ до решения "делаем/не делаем".
+- Нужно обсудить план с командой до начала работы.
+- Хочется JSON-план для передачи в другой инструмент или другую сессию.
+
+## Используемые примитивы
+
+В зависимости от плана:
+- `primitives/openapi-first-endpoint` — для каждого endpoint
+- `primitives/idempotency-handler` — для idempotent endpoints
+- `primitives/liquibase-migration` — для миграций
+- `primitives/kafka-producer-consumer` — для Kafka
+- `primitives/outbox-event` — для событий через Outbox
+- `primitives/scheduled-job` — для scheduled
+- `primitives/wiremock-integration-test` — для acceptance и интеграционных тестов
+
+Каждый примитив поддерживает режимы `skeleton` и `implement`. Используй `skeleton` в Phase 4 и `implement` в Phase 5.
+
+## TDD стратегия
+
+**Двухуровневый TDD:**
+
+1. **Acceptance-тест** (один на фичу, медленный, integration-уровень).
+   - Пишется в Phase 3, должен быть RED.
+   - Использует Testcontainers (PostgreSQL + Kafka).
+   - Покрывает acceptance criteria из плана.
+   - Зелёный → фича готова.
+
+2. **Unit-тесты per компонент** (быстрые, изолированные).
+   - В Phase 5 классический Red → Green → Refactor цикл.
+   - Mockito для зависимостей.
+   - `@DataJpaTest` для repo, `@WebMvcTest` для controller-слайса.
+
+## Workflow — 8 фаз
+
+### Phase 1 — Парсинг ТЗ → JSON-план
+
+Определи источник ТЗ:
+
+1. **Файл-ссылка** (`docs/refund-spec.md`, `tz/refund.md`) → `cat <путь>`.
+2. **Структурированный JSON в промпте** — валидируй структуру против формата ниже. Валиден → используй как есть.
+3. **Свободный промпт** ("сделай endpoint X с Kafka Y") — извлеки явно упомянутые компоненты, всё неупомянутое → `gaps`.
+
+#### Декомпозиция
+
+| Сигнал в ТЗ | Тип компонента |
+|---|---|
+| "endpoint", "API", "POST/GET/PUT/DELETE", "ручка" | `endpoint` |
+| "событие", "опубликовать в Kafka", "топик X" | `kafka_producer` (`via_outbox: true` по умолчанию) |
+| "слушать топик", "потреблять", "consumer" | `kafka_consumer` |
+| "таблица", "поле в БД", "схема" | `migration` |
+| "по расписанию", "cron", "каждый час" | `scheduled_job` |
+| "идемпотентно", "Idempotency-Key" | флаг `idempotent: true` на endpoint |
+
+#### Output формат — строгий JSON
+
+```json
+{
+  "version": "1.0",
+  "feature_name": "refund-creation",
+  "summary": "Возврат по платежу: endpoint + событие + listener",
+  "components": [
+    {
+      "type": "endpoint",
+      "id": "create-refund-endpoint",
+      "method": "POST",
+      "path": "/api/v1/refunds",
+      "idempotent": true,
+      "request_schema": {"name": "RefundRequest", "fields": [...]},
+      "response_schema": {"name": "RefundResponse", "fields": [...]},
+      "errors": [{"status": 409, "reason": "..."}, ...]
+    },
+    {
+      "type": "kafka_producer",
+      "topic": "pay-later.gateway.refund.created.out.queue",
+      "via_outbox": true,
+      "event_schema": {"name": "RefundCreatedEvent", "fields": [...]}
+    },
+    {
+      "type": "migration",
+      "tables": [{"schema": "{{ conventions.sql_schema }}", "name": "refund", "columns": [...], "indexes": [...]}]
+    }
+  ],
+  "acceptance_criteria": [
+    "POST /api/v1/refunds с валидным телом и Idempotency-Key возвращает 200",
+    "Повторный POST с тем же Idempotency-Key возвращает идентичный 200",
+    "В таблице outbox появляется запись с topic=...",
+    "..."
+  ],
+  "gaps": [
+    {"severity": "high|medium|low", "field": "...", "description": "..."}
+  ],
+  "primitive_skills_to_use": ["openapi-first-endpoint", "idempotency-handler", "outbox-event", ...],
+  "estimated_blast_radius": {
+    "modified_modules": ["..."],
+    "new_kafka_topics": ["..."],
+    "schema_changes": ["..."],
+    "breaking_changes": false
+  }
+}
+```
+
+#### Acceptance criteria
+
+Для каждого компонента — **минимум один acceptance criterion**. Формулировки должны быть **проверяемыми** (никаких "правильно работает", "корректно обрабатывает") — они станут acceptance-тестами в Phase 3.
+
+#### Gaps анализ (чек-листы по типу компонента)
+
+**Endpoint:** идемпотентность? error responses? validation? rate limiting? auth?
+**Kafka producer:** через Outbox? schema versioning? партиционирование?
+**Migration:** rollback? backfill? lock-time риски?
+**Scheduled job:** cron expression? распределённый лок? overlap с предыдущим запуском?
+
+Severity:
+- **high** — без этого нельзя начинать реализацию.
+- **medium** — можно с дефолтом, но стоит обсудить.
+- **low** — мелочь, поставлю стандартное значение.
+
+#### Estimated blast radius
+
+Прикинь: какие модули будут изменены, появляются ли новые Kafka топики, меняются ли существующие SQL таблицы (zero-downtime?), меняется ли публичный HTTP контракт (breaking?).
+
+#### Pre-check — фича уже существует?
+
+Перед Phase 2 быстро проверь, не реализована ли часть компонентов уже в кодовой базе (grep по path первого endpoint'а, по именам таблиц). Если **что-то найдено** — **failure-stop**:
+
+> Похоже что фича частично реализована (нашёл RefundController.java:34). Скилл `feature` создаёт с нуля — для добавления к существующей фиче используй `/update-feature <тот же ТЗ>`.
+
+Это защита от тихой перезаписи. Если пользователь настаивает на пересборке с нуля — он явно подтверждает и фича пересобирается с failure-stop на каждом коллизионном файле в Phase 4.
+
+### Phase 2 — Подтверждение плана ⏸ ПАУЗА
+
+Покажи пользователю:
+1. Краткий summary (1-2 строки).
+2. Список компонентов как чек-лист.
+3. Acceptance criteria.
+4. Gaps (высокий/средний приоритет) с предложениями дефолтов. Низкие — одной строкой "+ N мелких пробелов с дефолтами".
+5. Estimated blast radius.
+6. Полный JSON в code block — для копирования / передачи дальше.
+
+Если есть `severity: high` gaps — **не помечай план как готовый**. Спроси пользователя их закрыть.
+
+#### Развилка по режиму вызова
+
+- **`--plan-only`** → на этом всё. Отдай JSON-план как финальный артефакт, **не двигайся в Phase 3**. Сообщи: "План готов. Если решишь реализовывать — запусти `/feature <тот же вход>` без `--plan-only`".
+- **Полный режим** → спроси: "Готов начать реализацию? Если что-то не так в плане — поправь, и я перезапущу с Phase 1." После согласия — Phase 3.
+
+**Это единственная пауза в workflow.** Дальше работаем автономно до Phase 8.
+
+### Phase 3 — Acceptance тест (RED) 🔴
+
+Создай **один** интеграционный тест на всю фичу. Расположение: `src/test/java/{{ conventions.package_root }}/acceptance/<FeatureName>AcceptanceTest.java`.
+
+Структура:
+
+```java
+package {{ conventions.package_root }}.acceptance;
+
+import io.restassured.RestAssured;
+import io.restassured.http.ContentType;
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.KafkaContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+import static java.time.Duration.ofSeconds;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+@Testcontainers
+class RefundCreationAcceptanceTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15-alpine");
+
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.5.0"));
+
+    @DynamicPropertySource
+    static void registerProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+    }
+
+    @LocalServerPort
+    private int appPort;
+
+    @BeforeEach
+    void setUp() {
+        RestAssured.port = appPort;
+    }
+
+    // Один тест на каждый acceptance criterion из плана
+    @Test
+    void postRefund_withValidBody_returns200AndPublishesEvent() {
+        // given — существующий платёж в БД (см. Phase 4 — будут seed-fixtures)
+        // when — POST /api/v1/refunds
+        // then — 200, RefundResponse, запись в outbox, через ≤1сек sent_at != null
+
+        // Этот тест ДОЛЖЕН быть RED после Phase 3
+        // Зелёным становится после Phase 5 (когда реализация готова)
+    }
+
+    @Test
+    void postRefund_withSameIdempotencyKey_returnsIdenticalResponse() {
+        // ...
+    }
+
+    @Test
+    void postRefund_withNonExistentPaymentId_returns422() {
+        // ...
+    }
+}
+```
+
+После Phase 3:
+- Тесты компилируются (могут падать с `404 Not Found` или `Bean not found` — это OK).
+- Запуск `./mvnw test -Dtest=RefundCreationAcceptanceTest` — все тесты RED.
+
+### Phase 4 — Skeleton
+
+Цель: проект компилируется, acceptance-тесты падают **по бизнес-причине** (не по компиляции, не по отсутствию beans).
+
+Перед каждой записью файла — проверка что файла нет. Если файл существует — **failure-stop** "файл уже есть, для апдейта существующей фичи используй `/update-feature`". Никакой тихой перезаписи.
+
+Для каждого компонента из плана подгрузи соответствующий примитивный скилл и используй **режим skeleton**:
+
+1. **OpenAPI спека** — добавь endpoint в `openapi/*.yaml`.
+2. **DTO регенерация** — `./mvnw clean compile`.
+3. **Liquibase миграции** — создай changeset'ы для всех таблиц из плана. Применяются на старте теста через Testcontainers.
+4. **Controller skeleton** — `implements <Generated>Api`, методы возвращают `ResponseEntity.status(501).build()`.
+5. **Service skeleton** — методы выбрасывают `UnsupportedOperationException("TODO: Phase 5")`.
+6. **Kafka producer/consumer skeleton** — пустой listener, пустой publisher.
+7. **Outbox infrastructure** — таблица + entity + repository (без реальной публикации).
+
+После Phase 4:
+- `./mvnw clean install` проходит.
+- Acceptance-тесты падают с понятными бизнес-ошибками (501 от controller, IllegalStateException от service).
+
+### Phase 5 — TDD цикл per компонент
+
+Идём по компонентам в порядке:
+1. Migration (БД готова).
+2. Outbox infrastructure (если нужен).
+3. Service слой (бизнес-логика).
+4. Controller слой (тонкий, делегирует в service).
+5. Kafka producer (через outbox).
+6. Kafka consumer (если есть).
+7. Scheduled job (если есть).
+
+Для каждого компонента — классический цикл:
+
+#### 5.1 — Unit тест (RED)
+Напиши тест на следующее поведение компонента. Минимум 3 теста: happy path + 1-2 edge cases. Тесты падают (компонент пустой).
+
+```java
+@ExtendWith(MockitoExtension.class)
+class RefundServiceTest {
+    @Mock private RefundRepository refundRepository;
+    @Mock private PaymentRepository paymentRepository;
+    @Mock private OutboxService outboxService;
+    @InjectMocks private RefundService refundService;
+
+    @Test
+    void createRefund_paymentExists_savesRefundAndPublishesEvent() {
+        // given
+        UUID paymentId = UUID.randomUUID();
+        when(paymentRepository.findById(paymentId)).thenReturn(Optional.of(somePayment(paymentId)));
+
+        // when
+        RefundResponse response = refundService.createRefund(paymentId, 1000L, "test reason");
+
+        // then
+        assertThat(response.status()).isEqualTo("PENDING");
+        verify(refundRepository).save(any(Refund.class));
+        verify(outboxService).publish(eq("Refund"), any(UUID.class), eq("RefundCreated"), anyString(), any());
+    }
+
+    @Test
+    void createRefund_paymentNotFound_throwsPaymentNotFoundException() {
+        // ...
+    }
+}
+```
+
+#### 5.2 — Минимальная реализация (GREEN)
+Реализуй компонент **минимально достаточно**, чтобы unit-тесты прошли. Не добавляй фич, которых нет в тестах.
+
+#### 5.3 — Refactor (если нужно)
+Если код стал страшным (дублирование, длинные методы, неудачные имена) — рефактори. Тесты должны остаться зелёными.
+
+#### 5.4 — Verify
+```bash
+./mvnw -pl <module> test -Dtest=<ComponentName>Test
+```
+Все тесты компонента — GREEN. Двигайся к следующему компоненту.
+
+### Phase 6 — Acceptance check ✅
+
+```bash
+./mvnw test -Dtest=*AcceptanceTest
+```
+
+Все acceptance-тесты должны быть GREEN.
+
+Если что-то RED:
+- Какого компонента не хватило? Возвращайся в Phase 5 с уточнением.
+- Это значит unit-тесты компонента не покрыли реальный сценарий — допиши unit-тест и реализацию.
+
+**Не правь acceptance-тест, чтобы он стал зелёным.** Acceptance-тест — это спецификация. Если он не зелёный, фича не готова.
+
+### Phase 7 — Точечный регресс (модуль + acceptance)
+
+Полный test suite **здесь не запускаем** — это работа `workflow/create-mr` перед MR. Дублировать прогон бессмысленно.
+
+Здесь прогоняем только то, что реально могло пострадать:
+
+```bash
+# Тесты модуля, в котором писал код
+./mvnw -pl <module> test
+
+# Все acceptance-тесты (быстрый sanity check)
+./mvnw test -Dtest=*AcceptanceTest
+```
+
+Всё GREEN → Phase 8. Что-то RED в модуле — return в Phase 5.
+
+Code hygiene (быстрые проверки, не CI):
+- Линтер: `./mvnw spotless:check` или эквивалент.
+- Нет TODO/FIXME в новом коде (кроме явно осмысленных).
+- Нет `System.out.println`, `e.printStackTrace()` — только SLF4J.
+
+**Полный регресс (`{{ commands.test }}`) откладывается до `workflow/create-mr`.** Это единая точка истины для "готово к merge".
+
+### Phase 8 — Hand-off
+
+Покажи пользователю:
+
+```
+✅ Фича {{ feature_name }} реализована.
+
+Что сделано:
+  - [endpoint] POST /api/v1/refunds
+  - [migration] Таблица refund в схеме flp_baas_facade
+  - [outbox-event] RefundCreated в pay-later.gateway.refund.created.out.queue
+  - [acceptance-tests] 3 теста, все GREEN
+  - [unit-tests] 12 тестов в 4 классах
+
+Файлы изменены:
+  M openapi/payments.yaml
+  M src/main/resources/db/changelog/2026/05/...
+  A src/main/java/.../controller/RefundController.java
+  A src/main/java/.../service/RefundService.java
+  ...
+
+Что дальше:
+  → Запусти `workflow/create-mr` для создания ветки, ревью и MR.
+
+⚠️ Что осталось на ревью:
+  - Acceptance criterion #4 ("через ≤1сек sent_at != null") покрыт через Awaitility с 5сек таймаутом — продакшн SLA проверь отдельно.
+  - В service слое стоит TODO: business rule "нельзя возврат на платёж старше 90 дней" — gap из плана severity: medium.
+```
+
+## Жёсткие правила
+
+1. **Acceptance-тест пишется ДО реализации, не после.** Если соблазн "сначала код, потом тест" — это нарушение TDD, остановись.
+2. **Никаких пауз кроме Phase 2.** Если возникают сомнения — выбирай разумный дефолт и фиксируй в TODO. Финальный hand-off покажет все TODO.
+3. **Не правь acceptance-тест, чтобы он позеленел.** Acceptance-тест — спецификация.
+4. **Не пропускай Phase 7 (регресс).** Сломанные смежные тесты — баг новой фичи.
+5. **Каждый компонент имеет минимум 3 unit-теста.** Меньше — повод подумать что упускаешь.
+6. **Skeleton не перезаписывает существующие файлы.** Если в Phase 4 примитив натыкается на существующий файл — failure-stop с предложением переключиться на `/update-feature`.
+7. **`feature` — только для новых фич.** Если pre-check в Phase 1 обнаружил существующую реализацию — failure-stop, направление на `/update-feature`.
+
+## Подводные камни
+
+- **Testcontainers медленные.** Acceptance-тест выполняется минуту+. Это нормально, не пытайся ускорить заменой на in-memory — теряется смысл acceptance-теста.
+- **Flyway vs Liquibase в тестах.** Если в проекте Liquibase — Testcontainers сам его подцепит через `spring.liquibase.enabled=true`. Не нужно отдельных конфигов.
+- **`@DynamicPropertySource` против `@TestPropertySource`.** Для Testcontainers нужен `@DynamicPropertySource` — порты контейнеров известны только в runtime.
+- **`enable-auto-commit: false` для Kafka в тестах** — иначе flaky тесты, события "пропадают".
+- **Awaitility вместо Thread.sleep** для ожидания async событий (outbox publish).
+
+## Если пользователь хочет пропустить TDD
+
+Если пользователь явно говорит "сделай быстро без TDD" — попробуй убедить:
+- "Acceptance-тест займёт 5 минут написать, но защитит от регрессий навсегда. Оставим?"
+- Если настаивает — пропусти Phase 3 и 6, но **отметь это в hand-off как технический долг**.

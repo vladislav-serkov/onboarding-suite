@@ -1,0 +1,401 @@
+---
+name: outbox-event
+description: Используется для публикации доменного события через Outbox pattern — гарантия что событие отправится в Kafka даже при сбое после коммита транзакции. Триггеры — "опубликуй событие", "outbox event", "отправь в Kafka", "domain event", "событие <name>". Создаёт outbox-таблицу (или использует существующую), entity, repository с FOR UPDATE SKIP LOCKED, OutboxService для записи в той же транзакции что бизнес-логика, OutboxPublisher с @Scheduled для асинхронной отправки в Kafka. Поддерживает режимы skeleton и implement. Ключевая инвариантa — никогда не делать kafkaTemplate.send напрямую в @Transactional методе.
+---
+
+# outbox-event
+
+Доменное событие через Outbox pattern.
+
+## Зачем
+Прямой `kafkaTemplate.send()` в `@Transactional` ломает гарантии:
+- Транзакция БД может откатиться — а событие в Kafka уже улетело.
+- Kafka недоступна — транзакция падает по таймауту.
+
+Outbox решает: бизнес-операция и запись о событии — в **одной транзакции БД**. Отдельный publisher пушит из таблицы в Kafka асинхронно, с гарантией at-least-once.
+
+## Режимы работы
+
+- **`skeleton`** — таблица + entity + repository + сервис с throw `UnsupportedOperationException`. Publisher не активен. Используется в `feature` Phase 4.
+- **`implement`** — полная реализация с активным publisher.
+
+## Workflow
+
+### Шаг 1 — Outbox таблица (если ещё нет)
+
+См. `liquibase-migration`. Шаблон changeset'а:
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-create-outbox
+    author: <логин>
+    changes:
+      - createTable:
+          schemaName: {{ conventions.sql_schema }}
+          tableName: outbox
+          columns:
+            - column: { name: id, type: uuid, constraints: { primaryKey: true, nullable: false } }
+            - column: { name: aggregate_type, type: varchar(64), constraints: { nullable: false } }
+            - column: { name: aggregate_id, type: uuid, constraints: { nullable: false } }
+            - column: { name: event_type, type: varchar(128), constraints: { nullable: false } }
+            - column: { name: topic, type: varchar(256), constraints: { nullable: false } }
+            - column: { name: payload, type: jsonb, constraints: { nullable: false } }
+            - column: { name: headers, type: jsonb }
+            - column:
+                name: created_at
+                type: timestamp with time zone
+                defaultValueComputed: NOW()
+                constraints: { nullable: false }
+            - column: { name: sent_at, type: timestamp with time zone }
+            - column: { name: attempt_count, type: int, defaultValueNumeric: 0, constraints: { nullable: false } }
+            - column: { name: last_error, type: text }
+    rollback:
+      - dropTable: { schemaName: {{ conventions.sql_schema }}, tableName: outbox }
+
+- changeSet:
+    id: {{ today_yyyymmdd }}-02-outbox-pending-index
+    author: <логин>
+    changes:
+      - sql:
+          dbms: postgresql
+          sql: |
+            CREATE INDEX CONCURRENTLY idx_outbox_pending
+            ON {{ conventions.sql_schema }}.outbox (created_at)
+            WHERE sent_at IS NULL;
+    rollback:
+      - sql:
+          sql: DROP INDEX IF EXISTS {{ conventions.sql_schema }}.idx_outbox_pending;
+    runInTransaction: false
+```
+
+Партиальный индекс `WHERE sent_at IS NULL` — критичен. Без него publisher делает full scan по всей outbox-таблице, и она быстро становится горячей точкой.
+
+### Шаг 2 — Entity
+
+```java
+package {{ conventions.package_root }}.outbox;
+
+import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "outbox", schema = "{{ conventions.sql_schema }}")
+public class OutboxEntry {
+
+    @Id
+    private UUID id;
+
+    @Column(name = "aggregate_type", nullable = false)
+    private String aggregateType;
+
+    @Column(name = "aggregate_id", nullable = false)
+    private UUID aggregateId;
+
+    @Column(name = "event_type", nullable = false)
+    private String eventType;
+
+    @Column(nullable = false)
+    private String topic;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(nullable = false, columnDefinition = "jsonb")
+    private String payload;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String headers;
+
+    @Column(name = "created_at", nullable = false)
+    private Instant createdAt;
+
+    @Column(name = "sent_at")
+    private Instant sentAt;
+
+    @Column(name = "attempt_count", nullable = false)
+    private int attemptCount;
+
+    @Column(name = "last_error")
+    private String lastError;
+
+    protected OutboxEntry() {}
+
+    public OutboxEntry(UUID id, String aggregateType, UUID aggregateId,
+                       String eventType, String topic, String payload, String headers) {
+        this.id = id;
+        this.aggregateType = aggregateType;
+        this.aggregateId = aggregateId;
+        this.eventType = eventType;
+        this.topic = topic;
+        this.payload = payload;
+        this.headers = headers;
+        this.createdAt = Instant.now();
+        this.attemptCount = 0;
+    }
+
+    public void markSent() {
+        this.sentAt = Instant.now();
+    }
+
+    public void markFailed(String error) {
+        this.attemptCount++;
+        this.lastError = error;
+    }
+
+    // getters... (без @Data — CLAUDE.md §5)
+    public UUID getId() { return id; }
+    public String getTopic() { return topic; }
+    public String getPayload() { return payload; }
+    public String getHeaders() { return headers; }
+    public UUID getAggregateId() { return aggregateId; }
+    public String getEventType() { return eventType; }
+    public int getAttemptCount() { return attemptCount; }
+}
+```
+
+**Не** ставить `@Data` или `@EqualsAndHashCode` на JPA-сущности — ломает Hibernate.
+
+### Шаг 3 — Repository
+
+```java
+package {{ conventions.package_root }}.outbox;
+
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
+import org.springframework.data.jpa.repository.*;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+@Repository
+public interface OutboxRepository extends JpaRepository<OutboxEntry, UUID> {
+
+    @Query(value = """
+        SELECT * FROM {{ conventions.sql_schema }}.outbox
+        WHERE sent_at IS NULL
+        ORDER BY created_at
+        LIMIT :batchSize
+        FOR UPDATE SKIP LOCKED
+        """, nativeQuery = true)
+    List<OutboxEntry> lockBatchForPublishing(@Param("batchSize") int batchSize);
+
+    @Modifying(clearAutomatically = true)
+    @Query("DELETE FROM OutboxEntry o WHERE o.sentAt < :before")
+    int deleteSentBefore(@Param("before") Instant before);
+}
+```
+
+`FOR UPDATE SKIP LOCKED` обязателен — позволяет масштабировать publisher на несколько подов.
+`@Modifying(clearAutomatically = true)` обязателен на DELETE — иначе persistence context хранит удалённые сущности.
+
+### Шаг 4 — OutboxService (запись из бизнес-кода)
+
+```java
+package {{ conventions.package_root }}.outbox;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+public class OutboxService {
+
+    private final OutboxRepository repository;
+    private final ObjectMapper objectMapper;
+
+    public OutboxService(OutboxRepository repository, ObjectMapper objectMapper) {
+        this.repository = repository;
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * Записывает событие в outbox в РАМКАХ ВЫЗЫВАЮЩЕЙ транзакции.
+     * Propagation.MANDATORY — гарантия что метод вызван внутри @Transactional.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void publish(String aggregateType, UUID aggregateId, String eventType,
+                        String topic, Object payload, Map<String, String> headers) {
+        try {
+            String payloadJson = objectMapper.writeValueAsString(payload);
+            String headersJson = headers == null ? null : objectMapper.writeValueAsString(headers);
+
+            OutboxEntry entry = new OutboxEntry(
+                UUID.randomUUID(),
+                aggregateType,
+                aggregateId,
+                eventType,
+                topic,
+                payloadJson,
+                headersJson
+            );
+            repository.save(entry);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Не удалось сериализовать payload", e);
+        }
+    }
+}
+```
+
+`Propagation.MANDATORY` — защита от случая "забыл `@Transactional` в вызывающем методе". Лучше упасть на etape вызова, чем тихо потерять событие.
+
+### Шаг 5 — OutboxPublisher (асинхронная отправка)
+
+```java
+package {{ conventions.package_root }}.outbox;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class OutboxPublisher {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxPublisher.class);
+
+    private final OutboxRepository repository;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper;
+    private final int batchSize;
+
+    public OutboxPublisher(
+        OutboxRepository repository,
+        KafkaTemplate<String, String> kafkaTemplate,
+        ObjectMapper objectMapper,
+        @Value("${app.outbox.batch-size:100}") int batchSize
+    ) {
+        this.repository = repository;
+        this.kafkaTemplate = kafkaTemplate;
+        this.objectMapper = objectMapper;
+        this.batchSize = batchSize;
+    }
+
+    @Scheduled(fixedDelayString = "${app.outbox.poll-interval-ms:1000}")
+    @Transactional
+    public void publishPending() {
+        List<OutboxEntry> batch = repository.lockBatchForPublishing(batchSize);
+        if (batch.isEmpty()) return;
+
+        log.debug("Публикую {} событий из outbox", batch.size());
+
+        for (OutboxEntry entry : batch) {
+            try {
+                Map<String, String> headers = entry.getHeaders() == null
+                    ? Map.of()
+                    : objectMapper.readValue(entry.getHeaders(), new TypeReference<>() {});
+
+                var future = kafkaTemplate.send(entry.getTopic(), entry.getAggregateId().toString(), entry.getPayload());
+                SendResult<String, String> result = future.get();
+                RecordMetadata metadata = result.getRecordMetadata();
+
+                entry.markSent();
+                log.info("Опубликовано событие eventId={} topic={} partition={} offset={}",
+                    entry.getId(), metadata.topic(), metadata.partition(), metadata.offset());
+            } catch (Exception e) {
+                entry.markFailed(e.getMessage());
+                log.error("Не удалось опубликовать eventId={}, attempt={}", entry.getId(), entry.getAttemptCount(), e);
+                // НЕ выбрасываем — иначе откатится batch и другие события застрянут
+            }
+        }
+    }
+
+    @Scheduled(cron = "${app.outbox.cleanup-cron:0 0 3 * * *}")
+    @Transactional
+    public void cleanup() {
+        java.time.Instant before = java.time.Instant.now().minus(java.time.Duration.ofDays(7));
+        int deleted = repository.deleteSentBefore(before);
+        log.info("Очищено {} старых outbox записей (до {})", deleted, before);
+    }
+}
+```
+
+### Шаг 6 — Конфиг
+
+```yaml
+app:
+  outbox:
+    batch-size: 100
+    poll-interval-ms: 1000
+    cleanup-cron: "0 0 3 * * *"
+```
+
+Обязательно через property — захардкожено будет невозможно подкрутить под нагрузку без передеплоя.
+
+### Шаг 7 — Использование из бизнес-кода
+
+```java
+@Service
+public class RefundService {
+
+    private final RefundRepository refundRepository;
+    private final OutboxService outboxService;
+
+    public RefundService(RefundRepository refundRepository, OutboxService outboxService) {
+        this.refundRepository = refundRepository;
+        this.outboxService = outboxService;
+    }
+
+    @Transactional
+    public RefundResponse createRefund(UUID paymentId, long amount, String reason) {
+        Refund refund = new Refund(UUID.randomUUID(), paymentId, amount, "PENDING");
+        refundRepository.save(refund);
+
+        outboxService.publish(
+            "Refund",
+            refund.getId(),
+            "RefundCreated",
+            "{{ conventions.kafka_topic_template_resolved_for_refund_created }}",
+            new RefundCreatedPayload(refund.getId(), paymentId, amount, Instant.now()),
+            Map.of("eventVersion", "v1")
+        );
+
+        return new RefundResponse(refund.getId(), refund.getStatus());
+    }
+}
+```
+
+**Никаких прямых `kafkaTemplate.send`** в этом методе. Только outbox.
+
+## Что **не** делать
+
+- ❌ `kafkaTemplate.send()` напрямую в `@Transactional` методе.
+- ❌ Outbox без партиального индекса на `sent_at IS NULL`.
+- ❌ `@Data` на `OutboxEntry`.
+- ❌ Захардкоженый batch-size в коде.
+- ❌ `throw` в цикле публикации — потеря других событий из batch.
+- ❌ Cleanup без TTL — таблица будет расти бесконечно.
+
+## Подводные камни
+
+- **Hibernate JSON mapping.** Без `@JdbcTypeCode(SqlTypes.JSON)` jsonb колонки сохраняются как строки и не парсятся обратно.
+- **Multi-instance race.** Без `FOR UPDATE SKIP LOCKED` несколько подов публикуют одно событие дважды.
+- **Транзакция publisher'а.** Если transaction publisher'а падает — событие останется в outbox, попробуется снова. Это правильно. Не делай try/catch вокруг всего метода.
+- **At-least-once.** Outbox не гарантирует exactly-once. Consumer должен быть идемпотентным (см. `kafka-producer-consumer` шаг 5).
+
+## Связанные скиллы
+
+- Миграция → `liquibase-migration`
+- Consumer обрабатывающий событие → `kafka-producer-consumer`
+- Тест публикации → `wiremock-integration-test` (с `@EmbeddedKafka` или Testcontainers)

@@ -1,0 +1,259 @@
+---
+name: scheduled-job
+description: Используется для создания @Scheduled задачи с распределённым локом. Триггеры — "scheduled job", "cron", "по расписанию", "background task", "@Scheduled". Создаёт компонент с @Scheduled, externalized cron в application.yaml, опциональный распределённый лок (ShedLock или Redis или DB-based в зависимости от детектированной инфраструктуры проекта), правильный обработка ошибок чтобы один сбой не сломал расписание навсегда.
+---
+
+# scheduled-job
+
+Задача по расписанию с распределённым локом.
+
+## Зачем
+Без распределённого лока @Scheduled запускается на каждом поде одновременно. Для большинства задач это плохо: дубль публикации, дубль очистки, race condition при работе с БД.
+
+## Workflow
+
+### Шаг 1 — Включи @EnableScheduling
+
+В `@SpringBootApplication` или отдельном `@Configuration`:
+
+```java
+@Configuration
+@EnableScheduling
+public class SchedulingConfig {
+}
+```
+
+### Шаг 2 — Конфиг
+
+В `application.yaml`:
+
+```yaml
+app:
+  jobs:
+    refund-status-sync:
+      cron: "0 */5 * * * *"     # каждые 5 минут
+      enabled: true
+    cleanup-expired-records:
+      cron: "0 30 3 * * *"      # каждый день в 3:30
+      enabled: true
+```
+
+Cron захардкоженный в аннотации = невозможно подкрутить без передеплоя. Через property — гибко.
+
+### Шаг 3 — Простой scheduled job (без распределённого лока)
+
+Используй когда задача **идемпотентна** и параллельный запуск на нескольких подах безопасен (например, чтение метрик, прогрев кэша).
+
+```java
+package {{ conventions.package_root }}.jobs;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConditionalOnProperty(value = "app.jobs.refund-status-sync.enabled", havingValue = "true", matchIfMissing = true)
+public class RefundStatusSyncJob {
+
+    private static final Logger log = LoggerFactory.getLogger(RefundStatusSyncJob.class);
+    private final RefundStatusSyncService service;
+
+    public RefundStatusSyncJob(RefundStatusSyncService service) {
+        this.service = service;
+    }
+
+    @Scheduled(cron = "${app.jobs.refund-status-sync.cron}")
+    public void syncStatuses() {
+        try {
+            int synced = service.syncPendingRefunds();
+            log.info("Синхронизация refund статусов: обновлено {}", synced);
+        } catch (Exception e) {
+            log.error("Ошибка синхронизации refund статусов", e);
+            // НЕ выбрасываем — иначе следующий запуск может не произойти
+        }
+    }
+}
+```
+
+**Try/catch обязателен.** Если из @Scheduled метода вылетает unchecked exception — Spring логирует, но в зависимости от версии может либо продолжить расписание либо нет. Не полагаемся на это.
+
+### Шаг 4 — Scheduled с распределённым локом
+
+Выбор реализации зависит от стека проекта (см. discovery `patterns.uses_distributed_lock`):
+
+#### Вариант A: ShedLock (рекомендованный, простой)
+
+Зависимости:
+```xml
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-spring</artifactId>
+    <version>5.13.0</version>
+</dependency>
+<dependency>
+    <groupId>net.javacrumbs.shedlock</groupId>
+    <artifactId>shedlock-provider-jdbc-template</artifactId>
+    <version>5.13.0</version>
+</dependency>
+```
+
+Миграция (см. `liquibase-migration`):
+
+```yaml
+- changeSet:
+    id: {{ today_yyyymmdd }}-01-create-shedlock
+    changes:
+      - createTable:
+          schemaName: {{ conventions.sql_schema }}
+          tableName: shedlock
+          columns:
+            - column: { name: name, type: varchar(64), constraints: { primaryKey: true, nullable: false } }
+            - column: { name: lock_until, type: timestamp with time zone, constraints: { nullable: false } }
+            - column: { name: locked_at, type: timestamp with time zone, constraints: { nullable: false } }
+            - column: { name: locked_by, type: varchar(255), constraints: { nullable: false } }
+    rollback:
+      - dropTable: { schemaName: {{ conventions.sql_schema }}, tableName: shedlock }
+```
+
+Конфиг:
+
+```java
+@Configuration
+@EnableSchedulerLock(defaultLockAtMostFor = "PT10M")
+public class ShedLockConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .withTableName("{{ conventions.sql_schema }}.shedlock")
+                .usingDbTime()
+                .build()
+        );
+    }
+}
+```
+
+Job:
+
+```java
+@Component
+public class RefundStatusSyncJob {
+
+    @Scheduled(cron = "${app.jobs.refund-status-sync.cron}")
+    @SchedulerLock(
+        name = "refund-status-sync",
+        lockAtMostFor = "PT5M",       // максимум удержания (страховка от висящих)
+        lockAtLeastFor = "PT30S"      // минимум — против частых перезапусков
+    )
+    public void syncStatuses() {
+        // выполнится только на одном поде
+        ...
+    }
+}
+```
+
+`lockAtMostFor` обязателен — если pod упал держа лок, через `lockAtMostFor` он разблокируется автоматически.
+`lockAtLeastFor` защищает от случая когда pod закончил быстро, расписание тут же запустит другой pod.
+
+#### Вариант B: Redis-based (если уже есть Redis)
+
+Зависимости: `spring-boot-starter-data-redis` (обычно уже есть).
+
+```java
+@Component
+public class RefundStatusSyncJob {
+
+    private static final String LOCK_KEY = "lock:refund-status-sync";
+    private static final Duration LOCK_TTL = Duration.ofMinutes(5);
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final RefundStatusSyncService service;
+    private final String podId = UUID.randomUUID().toString();
+
+    public RefundStatusSyncJob(RedisTemplate<String, String> redisTemplate, RefundStatusSyncService service) {
+        this.redisTemplate = redisTemplate;
+        this.service = service;
+    }
+
+    @Scheduled(cron = "${app.jobs.refund-status-sync.cron}")
+    public void syncStatuses() {
+        Boolean acquired = redisTemplate.opsForValue()
+            .setIfAbsent(LOCK_KEY, podId, LOCK_TTL);
+
+        if (Boolean.FALSE.equals(acquired)) {
+            log.debug("Refund sync уже выполняется на другом поде, skip");
+            return;
+        }
+
+        try {
+            service.syncPendingRefunds();
+        } finally {
+            // снимаем лок только если он наш (защита от истечения TTL)
+            String currentOwner = redisTemplate.opsForValue().get(LOCK_KEY);
+            if (podId.equals(currentOwner)) {
+                redisTemplate.delete(LOCK_KEY);
+            }
+        }
+    }
+}
+```
+
+#### Вариант C: DB-based вручную (если нет ни Redis ни ShedLock)
+
+Простая таблица + `INSERT ... ON CONFLICT DO NOTHING` или `SELECT FOR UPDATE SKIP LOCKED`. Менее удобно чем ShedLock, не рекомендую если можно подключить ShedLock.
+
+### Шаг 5 — Тестирование
+
+```java
+@SpringBootTest
+@ActiveProfiles("test")
+class RefundStatusSyncJobTest {
+
+    @Autowired
+    private RefundStatusSyncJob job;
+
+    @MockBean
+    private RefundStatusSyncService service;
+
+    @Test
+    void syncStatuses_callsService() {
+        job.syncStatuses();
+        verify(service).syncPendingRefunds();
+    }
+
+    @Test
+    void syncStatuses_serviceThrows_jobDoesNotPropagate() {
+        when(service.syncPendingRefunds()).thenThrow(new RuntimeException("boom"));
+        // не должно бросить — try/catch внутри
+        assertThatNoException().isThrownBy(() -> job.syncStatuses());
+    }
+}
+```
+
+Тестировать конкретно cron-расписание не нужно — это конфиг, не логика.
+
+## Что **не** делать
+
+- ❌ `@Scheduled(cron = "0 */5 * * * *")` с захардкоженной строкой — выноси в property.
+- ❌ Без распределённого лока на не-идемпотентной задаче с несколькими подами.
+- ❌ `throw new Exception` из @Scheduled метода — может сломать расписание.
+- ❌ Долгая задача (>1 минуты) без `lockAtMostFor` достаточно большого размера — лок пропадёт, два пода полезут параллельно.
+- ❌ `@Async @Scheduled` одновременно — поведение зависит от версии Spring, не делай так.
+
+## Подводные камни
+
+- **`@Scheduled` не работает на компонентах с `@Lazy`.** Spring не создаст proxy.
+- **Cron с 6 vs 5 полями.** Spring `@Scheduled` использует **6 полей** (с секундами): `0 */5 * * * *`. Стандартный Unix cron — 5 полей. Не путай.
+- **TimeZone.** По умолчанию JVM timezone. Если приложение в UTC а cron должен работать по Москве — `@Scheduled(cron = "...", zone = "Europe/Moscow")`.
+- **ShedLock и Liquibase.** Liquibase сам умеет блокировать миграции, но иногда конфликтует со ShedLock'ом если использовать одну и ту же таблицу — используй разные таблицы (Liquibase свою `databasechangeloglock`, ShedLock свою `shedlock`).
+- **Restart during execution.** Если pod рестартует в середине задачи — лок останется до `lockAtMostFor`. Делай задачи **идемпотентными** даже под локом, на случай частичного выполнения.
+
+## Связанные скиллы
+
+- Миграция таблицы `shedlock` → `liquibase-migration`
+- Если задача публикует событие → `outbox-event`

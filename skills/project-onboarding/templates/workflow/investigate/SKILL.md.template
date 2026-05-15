@@ -1,0 +1,217 @@
+---
+name: investigate
+description: Используется когда есть симптомы проблемы, но непонятно где причина. Триггеры — "investigate", "разберись что происходит", "почему X происходит", "странное поведение", "consumer лагает", "память течёт", "вырос latency". Аналитический скилл — НЕ пишет код, производит отчёт с гипотезами и рекомендациями. Может выводить в bugfix или feature workflow если по итогам нужно править. Работает без пауз — это разовый аналитический проход.
+---
+
+# investigate
+
+Диагностика проблемы до понимания причины.
+
+## Когда использовать
+
+- Прод-инцидент с непонятной причиной.
+- "Что-то стало работать медленно".
+- "Иногда возвращает 500, не воспроизвести".
+- "Consumer стоит, не двигается".
+- Подготовка к bugfix, когда непонятно где править.
+
+**Не использовать для:**
+- Известного бага → сразу `workflow/bugfix`
+- Реализации новой функциональности → `workflow/feature`
+
+## Output формат
+
+Этот скилл **не пишет код**. Output — структурированный отчёт:
+
+```
+## Проблема
+[краткое описание симптомов из исходного запроса]
+
+## Что собрано
+- [факт 1 с источником]
+- [факт 2]
+...
+
+## Гипотезы (по убыванию вероятности)
+
+### Гипотеза 1: [название] — вероятность: HIGH
+**Обоснование:** ...
+**Что проверить:** ...
+**Если подтвердится — fix:** [намёк на bugfix или feature]
+
+### Гипотеза 2: ...
+
+## Рекомендации
+1. ...
+2. ...
+
+## Что дальше
+→ workflow/bugfix для гипотезы 1
+или
+→ workflow/feature для добавления observability
+```
+
+## Workflow — 4 фазы
+
+### Phase 1 — Сбор симптомов
+
+Из исходного запроса вытащи:
+- **Что происходит?** (наблюдаемое поведение)
+- **Что должно происходить?** (ожидаемое)
+- **Когда началось?** (после какого изменения / релиза)
+- **Воспроизводится?** (всегда / иногда / только под нагрузкой)
+- **Где видно?** (логи, метрики, прод, staging, локально)
+
+Если чего-то не хватает — задай **до 3 вопросов** одним сообщением, потом продолжай без пауз.
+
+### Phase 2 — Сбор данных из репо
+
+В зависимости от природы симптомов:
+
+#### Если "lat вырос / стало медленно":
+```bash
+# Какие компоненты могут быть медленными?
+grep -r "@Transactional\|@Cacheable\|RestTemplate\|WebClient" --include="*.java" -l | head
+
+# Long-running операции в @Transactional (анти-паттерн)
+grep -r -A 20 "@Transactional" --include="*.java" | grep -E "(restTemplate|webClient|kafkaTemplate.*\.send.*\.get|external)" -B 5 | head -50
+
+# N+1 риски
+grep -r "@OneToMany\|@ManyToMany" --include="*.java" -A 2 | grep -v "FetchType.LAZY"
+```
+
+#### Если "consumer лагает":
+```bash
+# Конфиг consumer'а
+grep -E "(max-poll-records|fetch-min|max-poll-interval|session.timeout)" \
+  $(find . -name "application*.yaml") 2>/dev/null
+
+# Что делает consumer внутри listener'а
+grep -r "@KafkaListener" --include="*.java" -l
+
+# Размер batch обработки
+grep -r "batch-listener\|@KafkaListener.*batch" --include="*.java"
+```
+
+Типичные причины:
+- Тяжёлая обработка в листенере (синхронный внешний вызов).
+- Маленький `max-poll-records` + большой объём.
+- `enable.auto.commit=true` без управляемого ack.
+- DLQ переполнен retry-петлёй.
+
+#### Если "иногда 500, не воспроизвести":
+```bash
+# Поиск unhandled exceptions
+grep -r "throw new\|RuntimeException" --include="*.java" -l | head
+
+# Race conditions
+grep -r "ConcurrentModification\|@Async" --include="*.java" -l
+
+# NullPointerException risks (Optional не используется)
+grep -r "\.get()" --include="*.java" | grep -v "Optional\|//\|Test" | head
+```
+
+#### Если "память течёт":
+```bash
+# Cache'и без TTL
+grep -r "Caffeine\|@Cacheable" --include="*.java" -A 3 | grep -E "(expire|ttl|maximum)" -B 5
+
+# Static collections
+grep -r "static.*Map\|static.*List\|static.*Set" --include="*.java" | grep -v "Test" | head
+
+# ThreadLocal без cleanup
+grep -r "ThreadLocal" --include="*.java" -B 2 -A 5 | grep -v "remove()" | head
+```
+
+#### Если "Outbox не отправляет":
+```bash
+grep -r "OutboxPublisher\|OutboxService" --include="*.java" -l
+
+# Конфиг
+grep -E "(outbox|poll-interval|batch-size)" $(find . -name "application*.yaml") 2>/dev/null
+
+# Таблица outbox в миграциях
+grep -r "outbox" --include="*.sql" --include="*.yaml" -l | head
+```
+
+### Phase 3 — Гипотезы
+
+Сгенерируй гипотезы. Для каждой:
+- **Название** — короткое описание причины.
+- **Вероятность:** HIGH / MEDIUM / LOW (по совокупности косвенных признаков).
+- **Обоснование** — какие факты из Phase 2 указывают на эту причину.
+- **Что проверить** — конкретные шаги (запустить запрос к БД, посмотреть метрику, прочитать кусок кода).
+- **Что делать если подтвердится** — намёк на следующий workflow.
+
+**Минимум 2 гипотезы**, даже если одна "очевидная". Очевидное часто оказывается не тем.
+
+Сортируй по убыванию вероятности.
+
+### Phase 4 — Отчёт
+
+Покажи в формате:
+
+```
+# Investigation: <короткое имя проблемы>
+
+## Симптомы
+- POST /api/v1/refunds иногда отвечает 500 (последняя неделя, ~2% запросов)
+- Стабильно воспроизводится в часы пиковой нагрузки
+
+## Что собрано
+- RefundService.createRefund — 84 строки, 3 внешних вызова в транзакции (см. RefundService:42-78)
+- Используется RestTemplate без таймаутов (RestTemplateConfig:18)
+- Outbox publisher poll-interval-ms = 1000 (нормально)
+- В логах — SocketTimeoutException на ~2% запросов
+
+## Гипотезы
+
+### Гипотеза 1: SocketTimeoutException при вызове платёжного провайдера в транзакции — вероятность HIGH
+**Обоснование:**
+- RestTemplate без таймаутов — read timeout = бесконечность по умолчанию
+- Вызов происходит внутри @Transactional метода (антипаттерн)
+- В часы пик внешний провайдер тормозит, длинные транзакции держат connection из пула, новые транзакции падают по timeout
+- В логах SocketTimeoutException совпадает по времени с пиковой нагрузкой
+
+**Что проверить:**
+- Метрика `payment_provider_response_time_seconds` — есть ли всплески
+- Connection pool метрики — `hikaricp_connections_pending`
+
+**Если подтвердится:**
+→ workflow/bugfix:
+1. Добавить connectTimeout/readTimeout в RestTemplate (5сек / 10сек)
+2. Вынести внешний вызов из @Transactional (антипаттерн в CLAUDE.md §3.4)
+3. Добавить Resilience4j circuit breaker
+
+### Гипотеза 2: Connection pool exhaustion из-за выросшего трафика — вероятность MEDIUM
+**Обоснование:**
+- HikariCP размер не менялся (10 connections), а трафик вырос
+- Не нашёл явных connection leaks в коде, но не исключаю
+
+**Что проверить:**
+- `hikaricp_connections_active` vs `hikaricp_connections_max`
+- Увеличить пул до 20, посмотреть на эффект
+
+## Рекомендации
+1. Срочно: добавить таймауты в RestTemplate (это хотфикс)
+2. В ближайшем спринте: вынести внешний вызов из транзакции + circuit breaker
+3. Долгосрочно: добавить distributed tracing — без него такие баги диагностируются вслепую
+
+## Что дальше
+→ Запусти `workflow/bugfix` с описанием: "RestTemplate без таймаутов в RefundService"
+   После hotfix — отдельный bugfix на вынос вызова из транзакции
+```
+
+## Жёсткие правила
+
+1. **Не пишу код.** investigate производит отчёт. Если хочется писать — это уже bugfix или feature.
+2. **Минимум 2 гипотезы.** Не скатывайся к одному "очевидному" объяснению.
+3. **Гипотезы должны быть проверяемыми.** "Что-то с инфрой" — это не гипотеза. "Connection pool exhaustion в HikariCP" — это гипотеза.
+4. **Никаких пауз.** investigate — разовый проход.
+5. **Привязывай гипотезы к артефактам.** Файл, строка, имя метрики, текст лога — ссылки на конкретику делают гипотезу проверяемой.
+
+## Подводные камни
+
+- **Selection bias.** Если ищешь "почему медленно" — найдёшь только подозрительные на медленность места. Проверь и нестандартные направления (GC, JIT, network).
+- **Overfit к симптому.** Если симптом "consumer лагает", очевидная гипотеза "consumer медленный". Проверь и producer (может быть burst publish), и Kafka cluster (может быть проблема не в твоём коде).
+- **Не игнорируй "стало после X".** Если пользователь говорит "началось после релиза N" — релиз N это первая гипотеза по умолчанию. Что туда вкатили?

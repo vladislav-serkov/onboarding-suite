@@ -1,0 +1,191 @@
+---
+name: verify
+description: Используется для сверки кода с ТЗ — проверяет что все компоненты и acceptance criteria из спеки реально реализованы в коде и покрыты тестами. Триггеры — "проверь покрытие ТЗ", "сверь код с ТЗ", "verify spec", "что не реализовано из ТЗ", "/verify", или передача ТЗ-файла с просьбой проверить покрытие. Не пишет код — производит отчёт-матрицу "criterion → реализован / покрыт тестом / orphan". Полезен при ревью чужого PR, аудите спринта, перед демо стейкхолдерам. Работает без пауз — разовый аналитический проход.
+---
+
+# verify
+
+Сверка ТЗ с кодом и тестами. Отчёт о покрытии без правок.
+
+## Когда использовать
+
+- Ревью чужого PR — ТЗ говорит X, но реализовано ли это?
+- Аудит спринта — какие из запланированных acceptance criteria действительно дошли до production-ready состояния.
+- Перед демо стейкхолдерам — проверить что все пункты ТЗ можно показать.
+- После `feature` или `update-feature` "чужими руками" — без участия Claude — проверить полноту.
+
+**Не использовать для:**
+- Реализации того что не нашлось → `feature` / `update-feature`
+- Исправления багов в найденной реализации → `bugfix`
+- Проверки готовности к проду (метрики, алерты, runbook) → отдельная задача (production-readiness)
+- Проверки против CLAUDE.md правил → `pr-review-checklist`
+
+## Output формат
+
+Этот скилл **не пишет код**. Output — структурированный отчёт.
+
+```
+# Verify: <имя фичи / ТЗ файл>
+
+ТЗ: docs/refund-spec.md (распарсено 5 компонентов, 8 acceptance criteria)
+Кодовая база: проверена на дату <ISO>
+
+## Сводка
+
+| Метрика | Значение |
+|---|---|
+| Компоненты реализованы | 4/5 (80%) |
+| Acceptance criteria покрыты тестами | 5/8 (62%) |
+| Orphan-код (есть в коде, нет в ТЗ) | 1 |
+| HIGH gaps (блокеры демо/прод) | 2 |
+
+## Компоненты
+
+| Компонент | Статус | Где найден | Заметки |
+|---|---|---|---|
+| POST /api/v1/refunds | ✅ implemented | RefundController.java:34, openapi/payments.yaml:120 | — |
+| Таблица refund | ✅ implemented | db/changelog/2026/03/refund-init.xml | — |
+| Событие RefundCreated | ⚠️ partial | OutboxService.java:88 (publish есть), но топик не совпадает: ТЗ — `pay-later.gateway.refund.created.out.queue`, код — `refund.created` | HIGH: расхождение имени топика |
+| POST /api/v1/refunds/cancel | ❌ missing | grep не нашёл | HIGH: новый пункт ТЗ не реализован |
+| RefundCancelled событие | ❌ missing | grep не нашёл | HIGH |
+
+## Acceptance criteria
+
+| # | Criterion | Реализовано | Тест | Статус |
+|---|---|---|---|---|
+| 1 | POST /refunds с валидным телом → 200 + RefundResponse | ✅ | RefundAcceptanceTest.postRefund_withValidBody:42 | ✅ |
+| 2 | Повторный POST с тем же Idempotency-Key → идентичный 200 | ✅ | RefundAcceptanceTest.postRefund_withSameKey:58 | ✅ |
+| 3 | В outbox появляется запись с topic=... | ⚠️ partial | RefundAcceptanceTest.postRefund_publishesEvent:72 — но проверяет другой топик | ⚠️ |
+| 4 | Через ≤1сек запись помечается sent_at | ❌ нет теста | — | ❌ Не покрыт |
+| 5 | POST с несуществующим paymentId → 422 | ✅ | RefundControllerTest.postRefund_paymentNotFound:91 | ✅ |
+| 6 | POST /refunds/cancel с валидным refundId → 200, status=CANCELLED | ❌ | — | ❌ Не реализовано |
+| 7 | После cancel в outbox запись с topic=...cancelled... | ❌ | — | ❌ Не реализовано |
+| 8 | Повторный cancel того же refundId → 409 | ❌ | — | ❌ Не реализовано |
+
+## Orphan-код
+
+Найдена логика которой нет в ТЗ:
+- `RefundController.applyDiscount()` (RefundController.java:120) — не упомянуто в ТЗ. Уточнить намерение или удалить.
+
+## Recommendations
+
+**HIGH (блокеры):**
+1. Реализовать POST /refunds/cancel + событие RefundCancelled → `/update-feature docs/refund-spec.md`
+2. Исправить имя топика `refund.created` → `pay-later.gateway.refund.created.out.queue` (breaking change для consumer'ов!) → `/bugfix`
+
+**MEDIUM:**
+3. Добавить тест на acceptance criterion #4 (sent_at через ≤1сек) → пометить ручным testcase
+
+**LOW:**
+4. Прояснить статус `RefundController.applyDiscount()` — orphan или забыли в ТЗ?
+
+## Что дальше
+→ `/update-feature docs/refund-spec.md` для пунктов 6-8
+→ После — повторный `/verify` чтобы убедиться что покрытие закрылось
+```
+
+## Workflow — 4 фазы
+
+### Phase 1 — Парсинг ТЗ
+
+Источник — markdown файл, JSON, или промпт. Парсинг идентичен `feature` Phase 1 — компоненты + acceptance criteria.
+
+**Отличие:** не нужен gaps-анализ и blast radius. Только:
+- `components[]` с `type`, `id`, опознавательными признаками (`path` для endpoint, `topic` для kafka, `name` для миграции).
+- `acceptance_criteria[]` — каждый criterion с уникальным id (`AC-1`, `AC-2`, ...).
+
+Если ТЗ не парсится — failure-stop, попроси привести его в распознаваемый формат.
+
+### Phase 2 — Сопоставление компонентов с кодом
+
+Для каждого компонента из ТЗ:
+
+| Тип | Поиск | Признак "найден" |
+|---|---|---|
+| `endpoint` | `path` в `openapi/**/*.yaml` + `@*Mapping.*"<path>"` в `*.java` | Оба места содержат |
+| `migration` | `tableName=` или `CREATE TABLE` в `src/main/resources/db/changelog/**` | Совпадение имени таблицы |
+| `kafka_producer` | `<topic>` в строковых литералах + `OutboxService.publish` или `kafkaTemplate.send` рядом | Топик встречается + есть отправка |
+| `kafka_consumer` | `@KafkaListener.*<topic>` | Аннотация с этим топиком |
+| `scheduled_job` | `@Scheduled` + сверка cron / имени | Аннотация на методе |
+
+Статус компонента:
+- ✅ **implemented** — нашёл все признаки, описание совпадает.
+- ⚠️ **partial** — нашёл базу, но есть расхождение (имя топика, поле в DTO, другой HTTP метод).
+- ❌ **missing** — следов нет.
+
+Для каждого partial — **зафиксируй конкретный diff** (что в ТЗ vs что в коде). Это самое ценное в отчёте.
+
+### Phase 3 — Сопоставление acceptance criteria с тестами
+
+Для каждого criterion ищи **тест который его проверяет**. Эвристика по убыванию надёжности:
+
+1. **Acceptance-тест:** `src/test/java/{{ conventions.package_root }}/acceptance/<Feature>AcceptanceTest.java`
+   - Имена методов часто прямо отражают criteria: "POST /refunds с валидным телом → 200" → метод `postRefund_withValidBody_returns200`.
+   - Если acceptance-тест отсутствует — серьёзный пробел.
+
+2. **Controller/Service unit-тесты:**
+   - Поиск по ключевым словам criterion: "422" → ищи `status().isUnprocessableEntity()` или `.status(422)`.
+   - "идемпотентн*" → ищи `idempotency` в имени теста.
+   - "outbox" → ищи `OutboxService` в моках/верифай.
+
+3. **Эвристика "ТЗ ↔ тест" по идентификаторам:**
+   - Если в criterion упомянут конкретный HTTP код (409, 422) — ищи assertion с этим кодом.
+   - Если упомянут топик — ищи `consumer.poll()` или `KafkaTemplate` с этим именем.
+   - Если упомянут SQL — ищи `countByX` / `findById` с теми же условиями.
+
+Статус criterion:
+- ✅ **covered** — нашёл хотя бы один тест который проверяет смысл criterion (test name + assertion совпадают).
+- ⚠️ **partial** — нашёл тест который касается темы, но проверяет не то (например, тест на сам endpoint есть, но конкретно sent_at через 1сек не проверяет).
+- ❌ **not covered** — не нашёл.
+
+**Будь осторожен с false-positive.** Если только имя теста похоже, но assertion проверяет что-то другое — это partial, не covered. Лучше явно скажи "тест X есть, но проверяет Y, не Z" чем замаскировать пробел.
+
+### Phase 4 — Orphan-detection (опционально)
+
+В обратную сторону: найди в коде компоненты которых **нет** в ТЗ.
+
+```bash
+# Все endpoint'ы текущей фичи (по package или модулю)
+grep -r "@(Get\|Post\|Put\|Delete\|Patch)Mapping" --include="*.java" -A 1 <feature-path>
+```
+
+Сравни список с компонентами из ТЗ. Не нашлось в ТЗ → orphan.
+
+**Orphan ≠ ошибка.** Возможно ТЗ устарело, или эта логика из другой задачи. Просто перечисли — пользователь сам решит.
+
+### Phase 5 — Отчёт
+
+Сформируй отчёт в формате выше. Ключевые правила:
+
+1. **Сводка первым делом.** Пользователь должен за 5 секунд понять "хорошо или плохо".
+2. **Компоненты и criteria — таблицы.** Не списки, не параграфы. Сканируемо.
+3. **Для partial — всегда конкретика diff.** "Топик в коде `refund.created`, в ТЗ `pay-later.gateway.refund.created.out.queue`" — не "топик не совпадает".
+4. **Recommendations с конкретными скиллами.** "Реализовать X → `/update-feature ...`", не "стоит реализовать X".
+5. **Severity:**
+   - **HIGH** — компонент missing/partial с breaking change, или больше 50% criteria not covered.
+   - **MEDIUM** — отдельные criteria not covered, partial с не-breaking diff.
+   - **LOW** — orphan-код без явных проблем, minor расхождения.
+
+## Жёсткие правила
+
+1. **Не пишу код.** verify — только отчёт. Если хочется писать — это `update-feature` или `bugfix`.
+2. **Не правлю тесты задним числом.** Если criterion not covered — это пробел в hand-off, не повод дописать тест "по ходу".
+3. **False-positive хуже false-negative.** Если сомневаешься "covered ли" — пометь partial и опиши почему сомневаюсь.
+4. **Никаких пауз.** verify — разовый проход.
+5. **Привязывай находки к файлам и строкам.** "Тест есть" — не помогает. "RefundAcceptanceTest.java:42 проверяет X" — помогает.
+
+## Подводные камни
+
+- **Acceptance-тестов может не быть** — фичу делали без TDD. Это не значит "не покрыто" — могут быть только controller/service-тесты. Проверь оба уровня.
+- **Имена тестов на английском, criteria на русском.** Транслитерация/перевод не очевидны. Ищи по содержимому assertion'ов, не только по имени.
+- **Один тест может покрывать несколько criteria.** Это нормально. Допускается ссылаться на один тест из нескольких строк отчёта.
+- **Generated code не считается реализацией.** Если endpoint только в OpenAPI-generated DTO, но controller возвращает 501 — это missing, не implemented.
+- **Закомментированные тесты.** Если тест `@Disabled` или закомментирован — он не covers criterion.
+- **Тест может быть зелёным, но проверять не то.** Пример: тест "endpoint возвращает 200" не проверяет криterion "повторный запрос возвращает идентичный response". Имя совпадает по теме, assertion — нет.
+
+## Связанные скиллы
+
+- `feature --plan-only` — если ТЗ ещё не реализовано, чтобы получить план.
+- `update-feature` — если verify нашёл missing компоненты в существующей фиче.
+- `bugfix` — если verify нашёл partial с явным несоответствием поведения ТЗ.
+- `pr-review-checklist` — проверяет diff против правил CLAUDE.md, не против ТЗ. Дополняет verify, не заменяет.

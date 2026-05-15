@@ -1,0 +1,181 @@
+---
+name: kafka-producer-consumer
+description: Используется для добавления Kafka producer'а или consumer'а. Триггеры — "новый топик", "kafka producer", "kafka consumer", "@KafkaListener", "publish event", "subscribe to topic". Producer всегда через Outbox (см. outbox-event). Consumer с DLQ + retry policy + идемпотентностью обработки. Naming топиков по паттерну проекта.
+---
+
+# kafka-producer-consumer
+
+Добавление Kafka producer'а или consumer'а.
+
+## Жёсткие правила
+- Producer **всегда** через Outbox. Прямой `kafkaTemplate.send()` запрещён в `@Transactional`.
+- Naming: `{{ conventions.kafka_topic_template }}`.
+- Каждый consumer имеет DLQ и retry policy.
+
+## Naming топиков
+
+Формат: `{{ conventions.kafka_topic_template }}`
+
+Примеры:
+- `pay-later.gateway.payment.created.out.queue`
+- `pay-later.rbo.flp.product.return.in.queue`
+
+DLQ: тот же + `.dlq`.
+
+## Producer
+
+См. `outbox-event` — producer всегда через Outbox.
+
+## Consumer
+
+### Шаг 1 — Конфиг
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: {{ project.name }}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: "{{ conventions.package_root }}.*"
+    listener:
+      ack-mode: manual
+
+app:
+  kafka:
+    topics:
+      product-return-in: pay-later.rbo.flp.product.return.in.queue
+      product-return-dlq: pay-later.rbo.flp.product.return.in.queue.dlq
+```
+
+### Шаг 2 — DTO события
+
+```java
+package {{ conventions.package_root }}.kafka.dto;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public record ProductReturnEvent(
+    UUID eventId,
+    UUID paymentId,
+    UUID productId,
+    long amount,
+    Instant occurredAt
+) {}
+```
+
+### Шаг 3 — Listener
+
+```java
+package {{ conventions.package_root }}.kafka.consumer;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Component
+public class ProductReturnListener {
+
+    private static final Logger log = LoggerFactory.getLogger(ProductReturnListener.class);
+    private final ProductReturnService service;
+
+    public ProductReturnListener(ProductReturnService service) {
+        this.service = service;
+    }
+
+    @KafkaListener(
+        topics = "${app.kafka.topics.product-return-in}",
+        groupId = "${spring.kafka.consumer.group-id}"
+    )
+    public void onProductReturn(ConsumerRecord<String, ProductReturnEvent> record, Acknowledgment ack) {
+        ProductReturnEvent event = record.value();
+        log.info("Получено событие возврата: eventId={}, paymentId={}", event.eventId(), event.paymentId());
+
+        try {
+            service.handleProductReturn(event);
+            ack.acknowledge();
+        } catch (RetryableException e) {
+            throw e;  // Spring Kafka retry → DLQ
+        } catch (Exception e) {
+            log.error("Не-retryable ошибка eventId={}", event.eventId(), e);
+            ack.acknowledge();
+            throw e;
+        }
+    }
+}
+```
+
+### Шаг 4 — DLQ + Retry
+
+```java
+@Configuration
+public class KafkaErrorHandlingConfig {
+
+    @Bean
+    public DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> template) {
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(
+            template,
+            (record, ex) -> new TopicPartition(record.topic() + ".dlq", record.partition())
+        );
+
+        ExponentialBackOff backOff = new ExponentialBackOff(1000L, 2.0);
+        backOff.setMaxInterval(30_000L);
+        backOff.setMaxElapsedTime(300_000L);
+
+        DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, backOff);
+        handler.addNotRetryableExceptions(IllegalArgumentException.class);
+        return handler;
+    }
+}
+```
+
+### Шаг 5 — Идемпотентность обработки
+
+```java
+@Transactional
+public void handleProductReturn(ProductReturnEvent event) {
+    if (processedEventRepository.existsById(event.eventId())) {
+        log.info("eventId={} уже обработано, skip", event.eventId());
+        return;
+    }
+    processedEventRepository.save(new ProcessedEvent(event.eventId(), Instant.now()));
+    // ... бизнес-логика ...
+}
+```
+
+Таблица `processed_event` создаётся через `liquibase-migration`:
+```sql
+CREATE TABLE {{ conventions.sql_schema }}.processed_event (
+    event_id UUID PRIMARY KEY,
+    processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+```
+
+## Что **не** делать
+
+- ❌ `kafkaTemplate.send()` напрямую в бизнес-методе.
+- ❌ Полагаться на порядок сообщений между партициями.
+- ❌ `Thread.sleep` в листенере.
+- ❌ Игнорировать DLQ.
+- ❌ `enable.idempotence=true` + `acks=1`.
+
+## Подводные камни
+
+- **Trusted packages:** без `spring.json.trusted.packages` JsonDeserializer падает с `IllegalArgumentException`.
+- **Headers vs body:** не клади бизнес-данные в headers.
+- **Topic creation:** `auto.create.topics.enable=false` на проде, топики создаёт инфра.
+
+## Связанные скиллы
+
+- Producer (через Outbox) → `outbox-event`
+- Миграция processed_event → `liquibase-migration`
+- Тесты → `wiremock-integration-test`

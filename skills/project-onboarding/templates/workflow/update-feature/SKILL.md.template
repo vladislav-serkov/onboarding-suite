@@ -1,0 +1,237 @@
+---
+name: update-feature
+description: Используется когда ТЗ уже частично реализовано и нужно дополнить фичу новыми пунктами (1.2, 1.3 добавились в обновлённой спеке) или изменить существующие компоненты. Триггеры — "доделай ТЗ", "обнови фичу", "ТЗ дополнилось", "/update-feature", "extend feature", "incremental feature", или передача обновлённого ТЗ-файла поверх существующей реализации. Запускает 6-фазный workflow — детект существующих компонентов → diff-план → подтверждение → реализация только нового/изменённого через TDD → regression на existing → handoff. Никогда не трогает existing-компоненты без явной маркировки `changed`. Не для фич с нуля — для этого используй `feature`.
+---
+
+# update-feature
+
+Дополнение существующей фичи новыми компонентами или апдейт существующих по обновлённому ТЗ.
+
+## Когда использовать
+
+- ТЗ обновилось (добавились пункты, поменялись поля) — нужно доделать разницу.
+- Хочешь добавить ещё один endpoint / consumer / событие в уже реализованную фичу.
+- Нужен incremental проход поверх существующего кода без перезаписи.
+
+**Не использовать для:**
+- Новой фичи с нуля → `feature`
+- Багфикса существующего поведения → `bugfix`
+- Полной пересборки фичи "снести и заново" → удали руками + `feature`
+
+## Используемые примитивы
+
+Те же что в `feature` — но используются только для new/changed компонентов:
+- `primitives/openapi-first-endpoint`
+- `primitives/idempotency-handler`
+- `primitives/liquibase-migration` (новый changeset, **никогда** не правит существующий)
+- `primitives/kafka-producer-consumer`
+- `primitives/outbox-event`
+- `primitives/scheduled-job`
+- `primitives/wiremock-integration-test`
+
+## Аргументы
+
+| Форма | Пример | Поведение |
+|---|---|---|
+| ТЗ-файл | `/update-feature docs/refund-spec.md` | Парсит ТЗ, детектит existing, реализует разницу |
+| ТЗ + имя фичи | `/update-feature refund docs/refund-spec.md` | То же, но `feature_name` фиксируется явно (для acceptance-теста) |
+| Только промпт | "доделай ТЗ по возвратам" | Если есть один очевидный кандидат — используй; иначе спроси какой ТЗ |
+
+## Workflow — 6 фаз
+
+### Phase 1 — Парсинг ТЗ + детект existing
+
+#### 1a. Парсинг ТЗ → JSON-план
+
+Источник входа: файл, JSON в промпте, или свободный промпт. Парсинг идентичен `feature` Phase 1 — таблица сигнал→тип компонента, JSON-формат, gaps, blast radius.
+
+См. формат компонентов и acceptance criteria в `workflow/feature/SKILL.md` Phase 1 (тот же JSON). Дублирование документации намеренно — скиллы версионируются независимо.
+
+#### 1b. Детект существующих компонентов
+
+Для каждого компонента из плана — grep по кодовой базе:
+
+| Тип компонента | Как проверить |
+|---|---|
+| `endpoint` | `grep` по `path` в `openapi/**/*.yaml` И по `@(Get\|Post\|Put\|Delete\|Patch)Mapping.*"<path>"` в `*.java` |
+| `migration` | `grep -r "CREATE TABLE.*<name>\|tableName=\"<name>\"" src/main/resources/db/changelog/` |
+| `kafka_producer` | `grep -r "<topic>"` в `*.java`, `*.yaml`. Дополнительно — Outbox-запись с этим event_type. |
+| `kafka_consumer` | `grep -r "@KafkaListener.*<topic>"` в `*.java` |
+| `scheduled_job` | `grep -r "@Scheduled" -A 2` + сверка cron / имени job |
+
+Каждому компоненту присваивай `status`:
+- `existing` — нашёл реализацию, ТЗ-описание совпадает с фактом. Пропускаем.
+- `changed` — нашёл, но ТЗ описывает другую сигнатуру (новые поля в DTO, изменённая схема таблицы, дополнительный error response). Нужен апдейт.
+- `new` — следов нет. Реализуем с нуля.
+
+Зафиксируй в JSON:
+
+```json
+"components": [
+  {"type": "endpoint", "id": "create-refund-endpoint", "status": "existing", "found_at": "RefundController.java:34"},
+  {"type": "endpoint", "id": "cancel-refund-endpoint", "status": "new"},
+  {"type": "migration", "id": "refund-add-cancellation-reason", "status": "changed", "found_at": "RefundEntity.java:12", "diff": "ТЗ добавляет поле cancellation_reason — в коде его нет"}
+],
+"incremental_summary": {
+  "new": 2,
+  "existing": 3,
+  "changed": 1,
+  "collisions": ["RefundController.java — будут правки для cancel-refund-endpoint"]
+}
+```
+
+**Если все компоненты `existing` без diff** — `update-feature` нечего делать. Сообщи "ТЗ полностью реализован, изменений не требуется" и выйди.
+
+**Если все компоненты `new`** — это значит фичи раньше не было, и `feature` подошёл бы лучше. Сообщи и предложи переключиться: "Не нашёл ни одного существующего компонента. Возможно, это новая фича — используй `/feature` вместо `update-feature`?". Если пользователь настаивает — продолжай как есть.
+
+### Phase 2 — Diff-план ⏸ ПАУЗА
+
+Покажи пользователю **только diff**:
+
+```
+Фича: refund-creation
+Обнаружено в коде:
+  ✓ POST /api/v1/refunds (RefundController.java:34)
+  ✓ Таблица refund (changelog 2026/03/refund-init.xml)
+  ✓ Событие RefundCreated (OutboxService)
+
+К добавлению из обновлённого ТЗ:
+  ✨ POST /api/v1/refunds/cancel
+  ✨ Событие RefundCancelled (топик pay-later.gateway.refund.cancelled.out.queue)
+  🔧 Таблица refund: добавить колонку cancellation_reason (varchar)
+
+Acceptance criteria (только для new/changed):
+  - POST /refunds/cancel с валидным refundId → 200 и RefundResponse(status=CANCELLED)
+  - После cancel в outbox появляется запись с topic=pay-later.gateway.refund.cancelled.out.queue
+  - Повторный cancel того же refundId → 409
+
+Gaps:
+  - HIGH: не указано можно ли отменять refund в статусе COMPLETED
+  - MEDIUM: TTL idempotency для /cancel не указан, поставлю 24h
+
+Регресс: при апдейте таблицы refund — миграция через ALTER (без table-rewrite), zero-downtime ок.
+
+Полный JSON ниже.
+```
+
+Спроси: "Готов реализовывать diff? Если что-то не так — поправь, я перезапущу Phase 1."
+
+**Это единственная пауза.** После согласия — автономно до Phase 6.
+
+### Phase 3 — Acceptance-тест: extend
+
+Найди существующий acceptance-тест (`src/test/java/{{ conventions.package_root }}/acceptance/*AcceptanceTest.java`) для этой фичи.
+
+**Сценарии:**
+
+1. **Acceptance-тест существует:**
+   - Добавь **новые `@Test` методы** под new/changed acceptance criteria.
+   - Существующие тесты не трогай — они уже зелёные, должны остаться зелёными.
+   - Новые тесты — RED после Phase 3.
+
+2. **Acceptance-теста нет** (фича была сделана без TDD):
+   - Создай новый файл `<FeatureName>AcceptanceTest.java` с **regression-тестами на existing** (минимально — happy path) + новыми RED-тестами для new/changed.
+   - Отметь в hand-off: "добавлены regression-тесты на existing — раньше их не было".
+
+После Phase 3:
+- Существующие тесты — GREEN.
+- Новые тесты — RED (компилируются, но падают по бизнес-причинам).
+
+### Phase 4 — Skeleton (только new/changed)
+
+Для каждого компонента **со status `new` или `changed`** — примитив в режиме `skeleton`.
+
+Жёсткие защиты от перезаписи:
+- Перед записью файла — `test -e <file>`. Если файл существует И статус `new` → **failure-stop**, что-то не так с детектом.
+- Для `changed` — никогда не перезаписывай файл целиком, только дополняй (добавь новый метод в существующий controller, новый changeset в существующий changelog).
+- **Liquibase:** для `changed` миграций всегда создавай новый changeset с уникальным id типа `2026-05-13-refund-add-cancellation-reason`. Не редактируй существующие changeset'ы — они уже применены на dev/staging/prod.
+
+Для existing-компонентов skeleton не запускается.
+
+После Phase 4:
+- `./mvnw clean install` проходит.
+- Новые acceptance-тесты падают с понятными бизнес-ошибками (501, IllegalStateException), существующие — зелёные.
+
+### Phase 5 — TDD цикл per новый компонент
+
+Идём только по new/changed компонентам в порядке: migration → outbox → service → controller → producer → consumer → scheduled.
+
+Классический цикл per компонент:
+1. **Unit-тест (RED)** — минимум 3 теста (happy + 2 edge).
+2. **Минимальная реализация (GREEN).**
+3. **Refactor.**
+4. **Verify** — `./mvnw -pl <module> test -Dtest=<ComponentName>Test`.
+
+**Для existing-компонентов unit-тесты в этом ране не пишем** — даже если покрытия нет. Отмечается как технический долг в hand-off.
+
+После прохода: запусти acceptance — новые тесты должны позеленеть, существующие остаются зелёными.
+
+### Phase 6 — Точечный регресс + hand-off
+
+Полный test suite **здесь не запускаем** — это работа `workflow/create-mr`. Дублировать не надо.
+
+```bash
+# Тесты модуля, в котором правил код
+./mvnw -pl <module> test
+
+# Acceptance-тесты фичи (включая существующие — incremental не должен ломать старое)
+./mvnw test -Dtest=*AcceptanceTest
+```
+
+Всё GREEN → hand-off. RED в существующих acceptance — incremental сломал старое, return в Phase 5.
+
+Особое внимание:
+- Если миграция `changed` — проверь rollback скрипт на test-БД.
+
+**Полный регресс (`{{ commands.test }}`) откладывается до `workflow/create-mr`.**
+
+#### Hand-off
+
+```
+✅ update-feature {{ feature_name }} — diff применён.
+
+Реализовано:
+  ✨ POST /api/v1/refunds/cancel
+  ✨ Событие RefundCancelled (через Outbox)
+  🔧 refund.cancellation_reason (новый changeset 2026-05-13-refund-add-cancellation-reason.xml)
+
+Не трогалось (status: existing):
+  ✓ POST /api/v1/refunds
+  ✓ Таблица refund (исходная)
+  ✓ Событие RefundCreated
+
+Тесты:
+  ✓ 3 новых acceptance-теста — GREEN
+  ✓ 8 новых unit-тестов — GREEN
+  ✓ Регресс 247 тестов — GREEN
+
+⚠️ Технический долг:
+  - existing-компоненты RefundCreated не покрыты unit-тестами (раньше не было). Можно отдельным таском.
+
+Что дальше:
+  → /create-mr MTSPAY-NNNN для отправки на ревью.
+```
+
+## Жёсткие правила
+
+1. **Существующий код не перезаписывается.** Никогда. Все правки — через "добавь рядом" (новый метод, новый changeset, новый @Test).
+2. **Существующие тесты должны остаться зелёными.** Это критерий что incremental не сломал старое.
+3. **Liquibase: только новые changeset'ы.** Уже применённые миграции не редактируются никогда.
+4. **Если детект показал что фичи нет** (все компоненты `new`) — предложи переключиться на `feature`. Не делай молча.
+5. **Если детект показал что фича полностью реализована** (всё `existing` без diff) — выйди, ничего не делай.
+6. **Никаких пауз кроме Phase 2.**
+7. **Acceptance-тест extend, не replace.** Добавляй новые `@Test` рядом с существующими.
+
+## Подводные камни
+
+- **"Похожие" имена.** Если в коде уже есть `RefundController`, а ТЗ описывает refunds в другом модуле — детект может выдать false-positive. В Phase 2 явно покажи `found_at` файлы — пользователь поймёт.
+- **Changed может оказаться breaking change.** Если ТЗ меняет тип поля или удаляет error response — это breaking для клиентов. Подними в gaps как HIGH.
+- **Acceptance-тест с Testcontainers не делится на "только новое".** Контейнеры одинаковы, тест-класс один. Просто добавляй методы.
+- **Outbox event versioning.** Если `changed` event добавляет поля — это новая версия события. Проверь schema registry / consumer compatibility.
+- **Не пытайся "почистить" existing код в этом ране.** Видишь смежный плохой код — заметка в hand-off, отдельная задача. Один скилл = одна цель.
+
+## Связанные скиллы
+
+- `feature` — для новых фич с нуля.
+- `bugfix` — если ТЗ описывает поведение которое существует, но работает неверно.
+- `create-mr` — после Phase 6 для отправки в GitLab.

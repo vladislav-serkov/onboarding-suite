@@ -1,0 +1,171 @@
+# CLAUDE.md — {{ project.name }}
+
+> Этот файл — единственный источник правды о конвенциях проекта для Claude Code.
+> Все скиллы в `.claude/skills/` опираются на правила отсюда.
+> Если правило здесь конфликтует со скиллом — побеждает CLAUDE.md.
+
+## 1. Stack snapshot
+
+- **Spring Boot:** {{ stack.spring_boot }}
+- **Java:** {{ stack.java_version }}
+- **Build:** {{ stack.build_system }} ({{ commands.build }})
+- **БД:** PostgreSQL + Liquibase ({{ libs.liquibase }})
+- **Сообщения:** Kafka, клиент {{ libs.kafka_client }}
+- **API спека:** OpenAPI 3 ({{ libs.openapi_generator }})
+- **Тесты:** JUnit 5, WireMock {{ libs.wiremock }}, REST Assured {{ libs.rest_assured }}, AssertJ
+- **Git:** {{ git.host }}, default branch `{{ git.default_branch }}`
+
+## 2. Команды
+
+| Что | Команда |
+|---|---|
+| Полная сборка | `{{ commands.build }}` |
+| Тесты | `{{ commands.test }}` |
+| Один модуль | `./mvnw -pl <module> clean install` |
+| Локальное окружение | `{{ commands.local_env }}` |
+| Регенерация OpenAPI DTO | `./mvnw clean compile` |
+| Применить миграции локально | `./mvnw -pl <module> liquibase:update` |
+| Откатить последнюю миграцию | `./mvnw -pl <module> liquibase:rollback -Dliquibase.rollbackCount=1` |
+
+## 3. Архитектурные инварианты
+
+> Это не рекомендации. Это правила, которые **нельзя нарушать** без явного согласования с командой.
+
+### 3.1 OpenAPI-first
+- Спека (`openapi/*.yaml`) — источник правды для всех HTTP контрактов.
+- Сгенерированные DTO **никогда не редактируются руками**. Если нужно поле — добавь в спеку, перегенерируй.
+- Controller'ы реализуют сгенерированные интерфейсы, не пишут эндпоинты с нуля.
+
+### 3.2 Outbox Pattern
+- Любой Kafka-event из транзакции БД идёт через Outbox.
+- Прямой `kafkaTemplate.send()` в бизнес-логике запрещён (исключение: fire-and-forget metrics, помечены явно).
+- Outbox таблица: партиальный индекс `WHERE sent_at IS NULL`, batch publisher с конфигом из `application.yaml`.
+
+### 3.3 Идемпотентность
+- Все mutating endpoints (POST/PUT/PATCH) принимают `Idempotency-Key` header.
+- Storage идемпотентности — отдельная таблица с TTL.
+- Replay должен возвращать **полностью идентичный** ответ, включая HTTP статус.
+
+### 3.4 Транзакционность
+- `@Transactional` на service-уровне, **не на controller**.
+- Outbox-запись — в той же транзакции что и бизнес-операция.
+- Long-running операции (внешние HTTP вызовы) — **вне** `@Transactional`.
+
+### 3.5 TDD
+- Новые фичи через workflow `feature` — acceptance-тест пишется первым, остаётся RED до реализации.
+- Багфиксы через workflow `bugfix` — reproduce-тест пишется первым, должен fail воспроизводя баг.
+- Минимальное покрытие: {{ team_decisions.coverage_threshold }}.
+
+## 4. Naming conventions
+
+| Что | Convention | Пример |
+|---|---|---|
+| Модули | `{{ topology.module_naming }}` | `bnpl-gateway-api` |
+| Корневой пакет | `{{ conventions.package_root }}` | `ru.mts.bnpl.gateway` |
+| SQL схема | `{{ conventions.sql_schema }}` | `flp_baas_facade.payment` |
+| Liquibase changeset id | `{{ conventions.changeset_naming }}` | `20260508-01-add-refund-table` |
+| HTTP пути | `{{ conventions.http_path_template }}` | `/api/v1/payments` |
+| Kafka топики | `{{ conventions.kafka_topic_template }}` | `pay-later.gateway.payment.created.out.queue` |
+| Git ветки | `{{ team_decisions.branch_naming }}` | `feature/BNPL-1234-refund` |
+| Commits | {{ team_decisions.commit_convention }} | `feat(refund): add POST /refunds` |
+
+**SQL обязательно:**
+- Префикс схемы во **всех** запросах: `SELECT * FROM {{ conventions.sql_schema }}.payment`, не `FROM payment`.
+- Liquibase changeset обязан иметь `<rollback>` или явный комментарий "irreversible: <причина>".
+
+## 5. Жёсткие запреты
+
+> Каждый запрет — следствие реального инцидента или регулярной ошибки.
+
+- ❌ **`@Data` на JPA сущностях.** Lombok генерирует `equals/hashCode` по всем полям, ломает Hibernate. Только `@Getter/@Setter` + ручной `equals/hashCode` по id.
+- ❌ **Lombok policy:** {{ team_decisions.lombok_policy }}.
+- ❌ **Прямой `kafkaTemplate.send()` в `@Transactional` методе.** Используй Outbox.
+- ❌ **SQL без префикса схемы.** `{{ conventions.sql_schema }}.payment`, не `payment`.
+- ❌ **Изменение сгенерированных OpenAPI DTO.** Меняй спеку.
+- ❌ **`@Modifying` без `clearAutomatically = true`** при дальнейшей работе с теми же сущностями в сессии.
+- ❌ **Не-детерминированные тесты** (полагающиеся на `Thread.sleep`, реальное время, порядок hashmap).
+- ❌ **Хардкод секретов в коде/конфигах.** Только через env variables или vault.
+
+## 6. Подводные камни проекта
+
+> Известные грабли. Прежде чем дебажить нечто странное — проверь сначала здесь.
+
+- **WireMock версии.** Клиент и сервер должны совпадать. У нас `{{ libs.wiremock }}`. Mismatch → молчаливые 404 на стабах.
+- **Embedded vs External WireMock.** При `@AutoConfigureWireMock(port = 0)` порт берётся из `wiremock.server.port` property. Хардкодить нельзя.
+- **Stub registration timing.** При `@SpringBootTest` стабы регистрируй в `@BeforeEach`, не `@BeforeAll` — иначе привязываются не к тому инстансу.
+- **OpenAPI DTO migration.** При смене версии openapi-generator меняется package сгенерённых DTO. `./mvnw clean` перед инкрементальной сборкой.
+- **Liquibase locks.** Если приложение упало во время миграции — `databasechangeloglock.LOCKED=true`. Очисти руками.
+- **Kafka idempotent producer.** При `enable.idempotence=true` нельзя `acks=1`.
+
+## 7. Тесты
+
+- **Unit тесты:** обязательно для service-слоя, mockito для зависимостей.
+- **Integration тесты:** обязательно для controller + repository.
+- **Acceptance тесты (для `feature`):** один на фичу, использует Testcontainers для PostgreSQL и Kafka.
+- **Минимальное покрытие:** {{ team_decisions.coverage_threshold }} для service-слоя.
+- **WireMock setup:** см. скилл `wiremock-integration-test` — там зафиксирован canonical способ.
+- **REST Assured + AssertJ:** избегай ambiguous overloads — импортируй `org.assertj.core.api.Assertions.assertThat` явно, не статически из обоих.
+
+## 8. Observability
+
+### Логирование
+- SLF4J + Logback. `@Slf4j` для логгера в классе.
+- **MDC обязательно для:** `correlation-id`, `user-id` (если есть auth context), `payment-id` для платёжных потоков.
+- **Маскирование PII/PCI:** PAN, CVV, SSN, паспортные данные — никогда в открытом виде в логах. Используй `MaskingConverter` или `@JsonProperty(access = WRITE_ONLY)`.
+- Уровни: `DEBUG` для трейса, `INFO` для бизнес-событий, `WARN` для recoverable ошибок, `ERROR` для unrecoverable.
+
+### Метрики
+- Micrometer + Prometheus.
+- Бизнес-метрики: `payment.created`, `refund.completed`, `outbox.published` — counter с tags по domain.
+- HTTP метрики автоматически через `spring-boot-starter-actuator`.
+
+### Tracing
+{{ team_decisions.tracing_setup }}
+
+## 9. Security
+
+- **Никаких секретов в коде.** Только env / vault.
+- **Authentication:** {{ team_decisions.auth_setup }}
+- **Authorization:** `@PreAuthorize` на service-методах для защищённых операций.
+- **Validation:** все request DTO валидируются через `@Valid` + `@NotNull`/`@Pattern`/`@Size`.
+- **PII в логах и БД:** маскирование обязательно (см. §8).
+- **CSRF:** для API сервисов отключен (stateless), но проверь `SecurityConfig`.
+
+## 10. Скиллы проекта
+
+В `.claude/skills/` лежат проектно-специфичные скиллы.
+
+### Workflow-скиллы (используй в первую очередь)
+| Скилл | Когда |
+|---|---|
+| `workflow/feature` | Реализация новой фичи от ТЗ через TDD. Опция `--plan-only` — только JSON-план без реализации |
+| `workflow/update-feature` | Дополнить существующую фичу по обновлённому ТЗ (incremental, без перезаписи existing) |
+| `workflow/verify` | Сверка ТЗ с кодом и тестами — отчёт что реализовано / покрыто / orphan. Не пишет код |
+| `workflow/bugfix` | Правка существующего поведения |
+| `workflow/investigate` | Диагностика проблемы (без кода) |
+| `workflow/create-mr` | Готовый код → ветка → ревью → тесты → MR |
+| `workflow/pr-review-checklist` | Проверить diff против правил CLAUDE.md |
+
+### Primitive-скиллы (вызываются workflow'ами или напрямую)
+| Скилл | Когда |
+|---|---|
+| `primitives/openapi-first-endpoint` | Новый HTTP endpoint |
+| `primitives/liquibase-migration` | Миграция БД |
+| `primitives/kafka-producer-consumer` | Kafka producer/consumer |
+| `primitives/outbox-event` | Доменное событие через Outbox |
+| `primitives/idempotency-handler` | Идемпотентность POST endpoint'а |
+| `primitives/wiremock-integration-test` | Интеграционный тест |
+| `primitives/scheduled-job` | `@Scheduled` с распределённым локом |
+
+## 11. Модули и границы
+
+{{ team_decisions.module_boundaries }}
+
+**Off-limits для агента:** {{ team_decisions.modules_off_limits | default("нет") }}.
+Эти модули можно читать, но **не редактировать** без явного запроса.
+
+## 12. Когда сомневаешься
+
+1. Сначала прочитай этот файл целиком.
+2. Если ответа нет — посмотри в `.claude/skills/`.
+3. Если и там нет — **спроси**, не выдумывай. Лучше один лишний вопрос, чем PR с нарушением конвенций.

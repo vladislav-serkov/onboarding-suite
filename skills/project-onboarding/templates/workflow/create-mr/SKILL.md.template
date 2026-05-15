@@ -1,0 +1,301 @@
+---
+name: create-mr
+description: Используется когда код готов и нужно создать MR в GitLab. Триггеры — "создай MR", "создай мр", "/create-mr", "create-mr", "submit", "пушни и сделай MR", "ветка + MR", "готово, запушь". Поддерживает аргумент с номером тикета — `/create-mr MTSPAY-10892` создаёт ветку `feature/MTSPAY-10892` и пишет коммит/MR description на русском. Запускает 5-фазный workflow — pre-flight checks → self-review через pr-review-checklist → полный прогон тестов → создание ветки от свежего develop → push и создание MR через glab CLI или GitLab API. Не задаёт пауз, но останавливается с явной ошибкой при провале любой фазы (failure-stop, не пауза-вопрос). Работает только с GitLab.
+---
+
+# create-mr
+
+Готовый код → ветка → ревью → тесты → MR в GitLab.
+
+## Когда использовать
+
+- Код реализован (через `feature` или `bugfix` или вручную).
+- Готов отправить на ревью команде.
+- Уверен что не сломал ничего критичного (но скилл всё равно проверит).
+
+**Не использовать для:**
+- WIP-коммитов в личную ветку → используй обычный git.
+- Hotfix без ревью → отдельный workflow (не предусмотрен).
+
+## Используемые примитивы
+
+- `workflow/pr-review-checklist` — для self-review в Phase 2.
+
+## Конфиг проекта
+
+Из `.claude/.onboarding-context.json`:
+- `git.host_url` — URL GitLab инстанса
+- `git.project_path` — `fintech/bnpl-gateway`
+- `git.default_branch` — обычно `develop`
+- `team_decisions.branch_naming` — шаблон имени ветки
+- `team_decisions.commit_convention` — `conventional` / `ticket-prefix` / `free`
+- `git.has_mr_template` + `git.mr_template_path`
+- `git.glab_available` + `git.glab_authenticated`
+
+## Аргументы
+
+Скилл умеет принимать один аргумент — **ticket id** в формате `<PROJECT>-<NUMBER>` (например, `MTSPAY-10892`, `BNPL-1234`).
+
+Способы вызова:
+
+| Форма | Пример | Поведение |
+|---|---|---|
+| Slash-команда с тикетом | `/create-mr MTSPAY-10892` | Берёт тикет из аргумента → ветка `feature/MTSPAY-10892` |
+| Естественный язык с тикетом | "создай мр по MTSPAY-10892" | То же самое — извлекает тикет regex'ом `[A-Z]+-\d+` |
+| Без тикета | `/create-mr` или "создай мр" | Пытается найти тикет в последних коммитах текущей ветки, в имени ветки, в `git log -1`. Если не нашёл — спрашивает у пользователя одним сообщением |
+
+**Если тикет передан аргументом — не задавай вопрос про номер.** Используй его как есть.
+
+## Язык коммитов и MR
+
+Коммиты, MR title, MR description пишутся **на русском языке**. Английский допустим только для:
+- технических идентификаторов (имена классов, эндпоинтов, топиков, таблиц)
+- conventional-commits префиксов (`feat`, `fix`, `chore` — если `commit_convention: conventional`)
+- цитат из логов / stack traces
+
+## Workflow — 5 фаз
+
+### Phase 1 — Pre-flight checks
+
+Цель: убедиться что diff содержит только то, что должно быть.
+
+```bash
+# Что у нас есть
+git status
+git diff --stat
+```
+
+Проверки:
+
+1. **Нет ли лишних файлов?**
+   - `.idea/`, `*.iml`, `.DS_Store`, `target/`, `build/` — должны быть в `.gitignore`. Если попали в diff — убери.
+   - Локальные конфиги (`application-local.yaml` с реальным паролями) — не должны коммититься.
+
+2. **Нет ли мусорного кода в diff?**
+   ```bash
+   git diff | grep -E "(System\.out\.println|console\.log|TODO|FIXME|XXX|debugger|e\.printStackTrace)"
+   ```
+   Каждая находка — обсуди:
+   - `TODO` намеренный (с указанием контекста)? — оставляем.
+   - `System.out.println` — заменяем на SLF4J.
+   - `e.printStackTrace()` — заменяем на `log.error("...", e)`.
+
+3. **Закомментированный код:**
+   ```bash
+   git diff | grep -E "^\+\s*//\s*(public|private|if|for|while|try|catch)"
+   ```
+   - Если нашёл — спроси нужно ли. Закомментированный код в коммите = технический долг.
+
+4. **Линтер/форматтер** (если используется):
+   ```bash
+   ./mvnw spotless:check 2>/dev/null || ./mvnw checkstyle:check 2>/dev/null
+   ```
+   Если падает — запусти автофикс: `./mvnw spotless:apply` и пересмотри diff.
+
+**Failure-stop:** Если на этой фазе нашёл серьёзные проблемы (debug-код, секреты в diff) — ОСТАНОВИСЬ и сообщи пользователю. Не двигайся в Phase 2.
+
+### Phase 2 — Self-review
+
+Запусти `workflow/pr-review-checklist` (см. `.claude/skills/workflow/pr-review-checklist/SKILL.md`):
+- Подаёт diff на проверку против правил CLAUDE.md.
+- Output — список нарушений с severity.
+
+Действие:
+- **HIGH severity нарушения** — failure-stop, остановись и сообщи.
+- **MEDIUM severity** — попробуй исправить автоматически (если очевидное), иначе сообщи и продолжай.
+- **LOW severity** — упомяни в hand-off, продолжай.
+
+### Phase 3 — Тесты
+
+```bash
+{{ commands.test }}
+```
+
+Полный прогон. Если что-то падает — **failure-stop**.
+
+Также проверь обязательные CI джобы:
+{{ git.ci_required_jobs_check }}
+
+Например:
+```bash
+# Sonar если есть
+./mvnw sonar:sonar -Dsonar.host.url=... 2>/dev/null
+
+# Integration тесты если отдельный профиль
+./mvnw verify -P integration-test
+```
+
+### Phase 4 — Git: ветка + commit + push
+
+#### Определение ticket id
+
+1. Если скилл вызван с аргументом (`/create-mr MTSPAY-10892`) — используй его без вопросов.
+2. Иначе попробуй извлечь из:
+   - имени текущей ветки (`git rev-parse --abbrev-ref HEAD` → regex `[A-Z]+-\d+`),
+   - последнего коммита (`git log -1 --pretty=%B`),
+   - сообщения пользователя.
+3. Если не нашёл — задай **один** вопрос: "Укажи номер тикета (например, MTSPAY-10892)".
+
+Зафиксируй значение в переменной `TICKET_ID`.
+
+#### Создание ветки
+
+```bash
+# Свежий develop
+git fetch origin {{ git.default_branch }}
+git checkout {{ git.default_branch }}
+git pull origin {{ git.default_branch }}
+
+# Имя ветки = feature/<TICKET_ID> (без описательного хвоста)
+BRANCH_NAME="feature/${TICKET_ID}"
+git checkout -b "$BRANCH_NAME"
+```
+
+Если шаблон `{{ team_decisions.branch_naming }}` требует описательный суффикс (`feature/TICKET-1234-short-description`) — сгенерируй короткий kebab-case суффикс из main-изменений (1-4 слова). При вызове через slash-команду с одним только ticket id — суффикс **не добавляй**, ветка = `feature/<TICKET_ID>` ровно.
+
+Если на ветке уже есть commit'ы (не на default branch) — спроси нужно ли начать заново или продолжить:
+- "Я нахожусь на ветке X не от свежего develop. Создать новую ветку и cherry-pick изменения, или продолжить с этой?"
+
+#### Коммиты (на русском)
+
+Группируй по логическим единицам, не по файлам. Текст коммита — на русском.
+
+Conventional Commits (если `commit_convention: conventional`):
+```
+feat(refund): добавлен эндпоинт POST /api/v1/refunds
+
+- Добавлена OpenAPI спека для создания возврата
+- Реализована идемпотентность через Idempotency-Key
+- Liquibase миграция для таблицы refund
+- Acceptance-тесты на Testcontainers
+
+Refs: MTSPAY-10892
+```
+
+Ticket-prefix (если `commit_convention: ticket-prefix`):
+```
+MTSPAY-10892: эндпоинт создания возврата
+
+POST /api/v1/refunds с идемпотентностью. Публикует событие
+RefundCreated в pay-later.gateway.refund.created.out.queue
+через Outbox.
+```
+
+Префиксы (`feat`, `fix`, `chore`) и технические идентификаторы (имена классов, топиков, таблиц) остаются на английском — переводу подлежит только нарративная часть.
+
+#### Push
+
+```bash
+git push -u origin "$BRANCH_NAME"
+```
+
+### Phase 5 — MR в GitLab
+
+#### Если glab установлен и авторизован
+
+```bash
+glab mr create \
+  --target-branch "{{ git.default_branch }}" \
+  --title "<title>" \
+  --description "<body>" \
+  --remove-source-branch
+```
+
+#### Fallback: GitLab API через curl
+
+```bash
+curl -X POST \
+  --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+  --header "Content-Type: application/json" \
+  --data @mr-payload.json \
+  "{{ git.host_url }}/api/v4/projects/$(echo '{{ git.project_path }}' | sed 's|/|%2F|g')/merge_requests"
+```
+
+Где `mr-payload.json`:
+```json
+{
+  "source_branch": "feature/MTSPAY-10892",
+  "target_branch": "{{ git.default_branch }}",
+  "title": "feat(refund): добавлен эндпоинт POST /api/v1/refunds",
+  "description": "<MR body на русском>",
+  "remove_source_branch": true,
+  "squash": false
+}
+```
+
+**MR title** должен начинаться с ticket id или conventional-префикса и быть на русском, например:
+- `MTSPAY-10892: создание возврата`
+- `feat(refund): добавлен эндпоинт POST /api/v1/refunds [MTSPAY-10892]`
+
+Если нет ни glab ни `GITLAB_TOKEN` — **failure-stop**, попроси пользователя залогиниться: `glab auth login` или `export GITLAB_TOKEN=...`.
+
+#### MR description
+
+Заполняй MR template если есть, иначе используй базовую структуру:
+
+```markdown
+## Что сделано
+- Добавлен endpoint POST /api/v1/refunds с идемпотентностью
+- Создание refund публикует событие RefundCreated в pay-later.gateway.refund.created.out.queue (через Outbox)
+- Liquibase миграция для таблицы {{ conventions.sql_schema }}.refund
+
+## Связанная задача
+- {{ TICKET_ID }} (например, MTSPAY-10892)
+
+## Как тестировалось
+- Acceptance test с Testcontainers (PostgreSQL + Kafka): 3 сценария
+- Unit-тесты RefundService: 5 сценариев
+- Полный регресс: ./mvnw verify, все тесты GREEN
+
+## Blast radius
+- Новые файлы: 8 (controller, service, dto, migration, tests)
+- Изменённые модули: bnpl-gateway-api, bnpl-gateway-core
+- Новый Kafka топик: pay-later.gateway.refund.created.out.queue
+  - Consumer'ы пока нет, но в RBO планируется (см. MTSPAY-10891)
+- Breaking changes: нет
+
+## Чек-лист (для ревьюера)
+- [ ] OpenAPI spec соответствует реализации
+- [ ] Idempotency покрыт тестами (повторный запрос → тот же response)
+- [ ] Outbox запись создаётся в той же транзакции что бизнес-логика
+- [ ] Логи не содержат PII
+```
+
+### Phase 6 — Hand-off
+
+```
+✅ MR создан.
+
+URL: {{ git.host_url }}/{{ git.project_path }}/-/merge_requests/<id>
+
+Ветка: feature/MTSPAY-10892
+Target: {{ git.default_branch }}
+
+Тесты:
+  ✓ {{ commands.test }} — 247 passed
+  ✓ pr-review-checklist — нарушений нет
+  ✓ Pre-flight — чисто
+
+Что осталось:
+  - Назначить ревьюеров вручную (или через codeowners если настроено)
+  - Дождаться зелёного CI
+  - После merge — проверить что миграция применилась на staging
+```
+
+## Жёсткие правила
+
+1. **Failure-stop при первой проблеме.** Не двигайся дальше пока не разрешено.
+2. **Не пушь сломанные тесты.** Phase 3 — обязательная.
+3. **Никогда не force-push в default branch.** Свои feature-ветки можно `--force-with-lease`.
+4. **Не создавай MR с пустым описанием.** Минимум — что сделано + чем тестировалось.
+5. **Чистый diff.** Никаких лишних файлов в коммите.
+6. **Если ticket id передан аргументом — не спрашивай повторно.** Ветка = `feature/<TICKET_ID>` ровно (без описательного суффикса), коммиты ссылаются на этот тикет.
+7. **Коммиты и MR description — на русском.** Технические идентификаторы и conventional-префиксы остаются на английском.
+
+## Подводные камни
+
+- **glab token может протухнуть.** Проверь `glab auth status` до push'а.
+- **`develop` может уйти вперёд.** После push — `git fetch && git rebase origin/{{ git.default_branch }}` если возникли conflicts. Не делай merge develop в feature-branch.
+- **Squash vs no-squash.** В GitLab настройки проекта могут принуждать squash. Не борись с ними.
+- **MR template variables.** Если MR template содержит variables (`{{ ticket }}`) — заполни их перед отправкой, иначе MR создастся с placeholder'ами.
+- **Self-hosted GitLab quirks.** Если GitLab на корпоративном инстансе — может потребоваться `--insecure` для curl или установка корп CA.
