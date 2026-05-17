@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Enforces: any push that changes files under plugins/<name>/ must also
+# bump the "version" field in plugins/<name>/.claude-plugin/plugin.json.
+# Without this, users running `/onboarding-suite:update` get new content
+# under the same version — confusing and breaks changelog expectations.
+
+set -euo pipefail
+
+ZERO="0000000000000000000000000000000000000000"
+fail=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue   # branch deletion
+
+  if [ "$remote_sha" = "$ZERO" ]; then
+    # new branch on remote — compare against origin/main if it exists, else skip
+    if git rev-parse --verify --quiet origin/main >/dev/null; then
+      range="origin/main..$local_sha"
+    else
+      continue
+    fi
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  # Plugin dirs touched in this push
+  plugins_changed=$(
+    git diff --name-only "$range" -- 'plugins/' 2>/dev/null \
+      | awk -F/ 'NF>=2 {print $1"/"$2}' \
+      | sort -u
+  )
+
+  for plugin_dir in $plugins_changed; do
+    manifest="$plugin_dir/.claude-plugin/plugin.json"
+    [ -f "$manifest" ] || continue
+
+    if ! git diff "$range" -- "$manifest" | grep -qE '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+      echo "✗ $plugin_dir has changes but \"version\" in $manifest was NOT bumped." >&2
+      echo "  Bump version (patch/minor/major) before pushing." >&2
+      fail=1
+    fi
+  done
+done
+
+exit $fail
