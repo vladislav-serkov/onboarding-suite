@@ -69,6 +69,12 @@
 | Git ветки | `{{ team_decisions.branch_naming }}` | `feature/BNPL-1234-refund` |
 | Commits | {{ team_decisions.commit_convention }} | `feat(refund): add POST /refunds` |
 
+**Комментарии:**
+- **Стиль:** {{ team_decisions.comment_style.style }}.
+- **Язык:** {{ team_decisions.comment_style.language }}.
+- Не описывай WHAT — самодокументирующиеся имена справляются лучше. Комментарий нужен только когда WHY не очевиден из кода (скрытый инвариант, workaround конкретного бага, неожиданное для читателя поведение).
+- Не оставляй TODO без тикета и автора: `// TODO(MTSPAY-1234, vserkov): ...`.
+
 **SQL обязательно:**
 - Префикс схемы во **всех** запросах: `SELECT * FROM {{ conventions.sql_schema }}.payment`, не `FROM payment`.
 - Liquibase changeset обязан иметь `<rollback>` или явный комментарий "irreversible: <причина>".
@@ -110,9 +116,12 @@
 
 ### Логирование
 - SLF4J + Logback. `@Slf4j` для логгера в классе.
+- **Требования команды:** {{ team_decisions.logging.requirements | join(", ") }}.
+- **Политика уровней:** {{ team_decisions.logging.levels_policy }}.
+- **Обязательно логировать:** {{ team_decisions.logging.must_log | join(", ") | default("на усмотрение автора") }}.
 - **MDC обязательно для:** `correlation-id`, `user-id` (если есть auth context), `payment-id` для платёжных потоков.
 - **Маскирование PII/PCI:** PAN, CVV, SSN, паспортные данные — никогда в открытом виде в логах. Используй `MaskingConverter` или `@JsonProperty(access = WRITE_ONLY)`.
-- Уровни: `DEBUG` для трейса, `INFO` для бизнес-событий, `WARN` для recoverable ошибок, `ERROR` для unrecoverable.
+- Уровни (дефолт): `DEBUG` для трейса, `INFO` для бизнес-событий, `WARN` для recoverable ошибок, `ERROR` для unrecoverable.
 
 ### Метрики
 - Micrometer + Prometheus.
